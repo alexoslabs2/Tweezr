@@ -1,0 +1,23 @@
+services:
+  xvbot:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: xvbot:latest
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    environment:
+      LOG_DIR: /var/log/xvbot
+    volumes:
+      - xvbot-logs:/var/log/xvbot
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  xvbot-logs:

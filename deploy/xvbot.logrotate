@@ -1,0 +1,10 @@
+/var/log/xvbot/bot.log {
+    daily
+    rotate 14
+    compress
+    missingok
+    notifempty
+    postrotate
+        systemctl kill -s HUP xvbot.service
+    endscript
+}

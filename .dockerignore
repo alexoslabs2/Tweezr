@@ -1,0 +1,12 @@
+.env
+.git
+.agents
+.codex
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyo
+*.log
+deploy/
+test_providers.py
+AGENT.md
