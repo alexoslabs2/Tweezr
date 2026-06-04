@@ -1,6 +1,6 @@
 # Tweezr
 
-Tweezr is a long-lived Telegram bot that watches one private channel for X/Twitter status URLs, downloads the best available video through a public-provider cascade, reposts the video into the same channel, and deletes the original URL message.
+Tweezr is a long-lived Telegram bot that watches one private channel for X/Twitter status URLs and RedGifs watch URLs, downloads the best available video, reposts the video into the same channel, and deletes the original URL message.
 
 ## Files
 

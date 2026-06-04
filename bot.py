@@ -69,6 +69,11 @@ TWITTER_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+REDGIFS_URL_RE = re.compile(
+    r"https?://(www\.)?redgifs\.com/watch/[A-Za-z0-9_-]+/?",
+    re.IGNORECASE,
+)
+
 
 def _https_url(url: str) -> str:
     if url.lower().startswith("http://"):
@@ -78,6 +83,13 @@ def _https_url(url: str) -> str:
 
 def extract_tweet_url(text: str) -> str | None:
     match = TWITTER_URL_RE.search(text)
+    if not match:
+        return None
+    return _https_url(match.group(0))
+
+
+def extract_redgifs_url(text: str) -> str | None:
+    match = REDGIFS_URL_RE.search(text)
     if not match:
         return None
     return _https_url(match.group(0))
@@ -106,20 +118,54 @@ async def resolve_tco_url(text: str, client: httpx.AsyncClient) -> str | None:
         return None
 
     for response_url in [item.url for item in response.history] + [response.url]:
-        tweet_url = extract_tweet_url(str(response_url))
-        if tweet_url:
-            return tweet_url
+        source_url = extract_supported_url(str(response_url))
+        if source_url:
+            return source_url
     return None
 
 
-async def extract_message_tweet_url(text: str, client: httpx.AsyncClient) -> str | None:
-    twitter_match = TWITTER_URL_RE.search(text)
-    tco_match = TCO_URL_RE.search(text)
+def extract_supported_url(text: str) -> str | None:
+    matches = [
+        match
+        for match in (
+            TWITTER_URL_RE.search(text),
+            REDGIFS_URL_RE.search(text),
+        )
+        if match
+    ]
+    if not matches:
+        return None
+    return _https_url(min(matches, key=lambda match: match.start()).group(0))
 
-    if twitter_match and (not tco_match or twitter_match.start() < tco_match.start()):
-        return _https_url(twitter_match.group(0))
-    if tco_match:
-        return await resolve_tco_url(_https_url(tco_match.group(0)), client)
+
+def _is_redgifs_url(url: str) -> bool:
+    return REDGIFS_URL_RE.fullmatch(url) is not None
+
+
+async def extract_message_source_url(text: str, client: httpx.AsyncClient) -> str | None:
+    matches = [
+        match
+        for match in (
+            TWITTER_URL_RE.search(text),
+            REDGIFS_URL_RE.search(text),
+            TCO_URL_RE.search(text),
+        )
+        if match
+    ]
+    if not matches:
+        return None
+
+    first_match = min(matches, key=lambda match: match.start())
+    first_url = _https_url(first_match.group(0))
+    if TCO_URL_RE.fullmatch(first_url):
+        return await resolve_tco_url(first_url, client)
+    return first_url
+
+
+async def extract_message_tweet_url(text: str, client: httpx.AsyncClient) -> str | None:
+    source_url = await extract_message_source_url(text, client)
+    if source_url and TWITTER_URL_RE.fullmatch(source_url):
+        return source_url
     return None
 
 
@@ -153,6 +199,75 @@ def _optional_int(value: object) -> int | None:
         if digits:
             return int(digits)
     return None
+
+
+def _extract_redgifs_id(redgifs_url: str) -> str | None:
+    path_parts = [part for part in urlparse(redgifs_url).path.split("/") if part]
+    if len(path_parts) < 2 or path_parts[0].lower() != "watch":
+        return None
+    return path_parts[1]
+
+
+def _redgifs_variant_label(gif: dict) -> str | None:
+    width = _optional_int(gif.get("width"))
+    height = _optional_int(gif.get("height"))
+    if width and height:
+        return f"{width}x{height}"
+    return None
+
+
+async def provider_redgifs(
+    redgifs_url: str,
+    client: httpx.AsyncClient,
+) -> list[VideoVariant] | None:
+    logger = logging.getLogger("provider_redgifs")
+    redgifs_id = _extract_redgifs_id(redgifs_url)
+    if not redgifs_id:
+        return None
+
+    try:
+        token_response = await client.get(
+            "https://api.redgifs.com/v2/auth/temporary",
+            headers=_provider_headers("https://www.redgifs.com/"),
+        )
+        token_response.raise_for_status()
+        token = token_response.json().get("token")
+        if not isinstance(token, str) or not token:
+            return None
+
+        media_response = await client.get(
+            f"https://api.redgifs.com/v2/gifs/{redgifs_id}",
+            headers={
+                **_provider_headers(redgifs_url),
+                "Authorization": f"Bearer {token}",
+            },
+        )
+        media_response.raise_for_status()
+        payload = media_response.json()
+        gif = payload.get("gif")
+        if not isinstance(gif, dict):
+            return None
+        urls = gif.get("urls")
+        if not isinstance(urls, dict):
+            return None
+
+        variants = []
+        quality_label = _redgifs_variant_label(gif)
+        for key in ("hd", "sd", "file", "file_url"):
+            variant_url = _https_variant_url(urls.get(key))
+            if not variant_url:
+                continue
+            variants.append(
+                VideoVariant(
+                    url=variant_url,
+                    quality_label=quality_label if key in ("hd", "file", "file_url") else None,
+                    bitrate=None,
+                )
+            )
+        return variants or None
+    except Exception as exc:
+        logger.warning("provider failed: %s", exc)
+        return None
 
 
 async def provider_savetwt(
@@ -443,6 +558,10 @@ PROVIDERS = [
     provider_getxbot,
 ]
 
+REDGIFS_PROVIDERS = [
+    provider_redgifs,
+]
+
 
 RESOLUTION_RE = re.compile(r"(\d{2,5})\s*[xX]\s*(\d{2,5})")
 
@@ -476,14 +595,15 @@ def pick_best_variant(variants: list[VideoVariant]) -> VideoVariant:
     return variants[0]
 
 
-async def download_best_video(tweet_url: str) -> Path | None:
+async def download_best_video(source_url: str) -> Path | None:
     logger = logging.getLogger("download_best_video")
+    providers = REDGIFS_PROVIDERS if _is_redgifs_url(source_url) else PROVIDERS
     timeout = httpx.Timeout(DOWNLOAD_TIMEOUT_SECONDS)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-        for provider in PROVIDERS:
+        for provider in providers:
             provider_name = provider.__name__
             try:
-                variants = await provider(tweet_url, client)
+                variants = await provider(source_url, client)
             except Exception as exc:
                 logging.getLogger(provider_name).warning("provider raised: %s", exc)
                 variants = None
@@ -501,7 +621,11 @@ async def download_best_video(tweet_url: str) -> Path | None:
                 async with client.stream(
                     "GET",
                     best.url,
-                    headers={"User-Agent": USER_AGENT, "Accept": "*/*"},
+                    headers={
+                        "User-Agent": USER_AGENT,
+                        "Referer": source_url,
+                        "Accept": "*/*",
+                    },
                 ) as response:
                     response.raise_for_status()
                     with temp_path.open("wb") as output:
@@ -524,15 +648,29 @@ def _file_too_large_error(exc: TelegramError) -> bool:
     return "file is too big" in message or "request entity too large" in message
 
 
-async def _send_video_or_document(ctx: ContextTypes.DEFAULT_TYPE, video_path: Path, tweet_url: str) -> bool:
+async def _send_video_or_document(ctx: ContextTypes.DEFAULT_TYPE, video_path: Path, source_url: str) -> bool:
     logger = logging.getLogger("handle_message")
+    if video_path.stat().st_size > MAX_VIDEO_SIZE_BYTES:
+        logger.info("video exceeds send_video size cap; sending as document")
+        with video_path.open("rb") as document:
+            try:
+                await ctx.bot.send_document(
+                    chat_id=CHANNEL_ID,
+                    document=document,
+                    caption=source_url,
+                )
+                return True
+            except TelegramError as exc:
+                logger.error("send_document failed: %s", exc)
+                return False
+
     with video_path.open("rb") as video:
         for attempt, delay in enumerate([1, 4, 16, None], start=1):
             try:
                 await ctx.bot.send_video(
                     chat_id=CHANNEL_ID,
                     video=video,
-                    caption=tweet_url,
+                    caption=source_url,
                     supports_streaming=True,
                 )
                 return True
@@ -557,7 +695,7 @@ async def _send_video_or_document(ctx: ContextTypes.DEFAULT_TYPE, video_path: Pa
             await ctx.bot.send_document(
                 chat_id=CHANNEL_ID,
                 document=document,
-                caption=tweet_url,
+                caption=source_url,
             )
             return True
         except TelegramError as exc:
@@ -565,7 +703,7 @@ async def _send_video_or_document(ctx: ContextTypes.DEFAULT_TYPE, video_path: Pa
             return False
 
 
-async def _alert_admin(ctx: ContextTypes.DEFAULT_TYPE, tweet_url: str) -> None:
+async def _alert_admin(ctx: ContextTypes.DEFAULT_TYPE, source_url: str) -> None:
     if not ADMIN_CHAT_ID:
         return
     logger = logging.getLogger("handle_message")
@@ -580,7 +718,7 @@ async def _alert_admin(ctx: ContextTypes.DEFAULT_TYPE, tweet_url: str) -> None:
     try:
         await ctx.bot.send_message(
             chat_id=admin_chat_id,
-            text=f"XVBOT failed to download: {tweet_url}",
+            text=f"XVBOT failed to download: {source_url}",
         )
     except TelegramError as exc:
         logger.warning("admin alert failed: %s", exc)
@@ -596,17 +734,17 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 return
 
             async with httpx.AsyncClient(timeout=httpx.Timeout(DOWNLOAD_TIMEOUT_SECONDS)) as client:
-                tweet_url = await extract_message_tweet_url(message.text, client)
-            if not tweet_url:
+                source_url = await extract_message_source_url(message.text, client)
+            if not source_url:
                 return
 
-            temp_path = await download_best_video(tweet_url)
+            temp_path = await download_best_video(source_url)
             if temp_path is None:
                 logger.error("all providers failed for URL")
-                await _alert_admin(ctx, tweet_url)
+                await _alert_admin(ctx, source_url)
                 return
 
-            uploaded = await _send_video_or_document(ctx, temp_path, tweet_url)
+            uploaded = await _send_video_or_document(ctx, temp_path, source_url)
             if not uploaded:
                 return
 
