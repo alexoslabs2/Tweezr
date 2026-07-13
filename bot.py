@@ -51,23 +51,44 @@ CHUNK_SIZE = 32 * 1024
 
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 _formatter = logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
+
+
+class _SecretRedactionFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        redacted = message.replace(TOKEN, "<redacted>")
+        if redacted != message:
+            record.msg = redacted
+            record.args = ()
+        return True
+
+
+_secret_filter = _SecretRedactionFilter()
 _file_handler = RotatingFileHandler(
     LOG_DIR / "bot.log",
     maxBytes=10 * 1024 * 1024,
     backupCount=5,
 )
 _file_handler.setFormatter(_formatter)
+_file_handler.addFilter(_secret_filter)
 _stream_handler = logging.StreamHandler()
 _stream_handler.setFormatter(_formatter)
+_stream_handler.addFilter(_secret_filter)
 _root_logger = logging.getLogger()
 _root_logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 _root_logger.handlers.clear()
 _root_logger.addHandler(_file_handler)
 _root_logger.addHandler(_stream_handler)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("main")
 
 
-VideoVariant = namedtuple("VideoVariant", ["url", "quality_label", "bitrate"])
+VideoVariant = namedtuple(
+    "VideoVariant",
+    ["url", "quality_label", "bitrate", "size_bytes"],
+    defaults=[None],
+)
 
 
 TWITTER_URL_RE = re.compile(
@@ -366,7 +387,8 @@ def _extract_eporner_variants(eporner_url: str) -> list[VideoVariant]:
 
         tbr = item.get("tbr")
         bitrate = int(tbr * 1000) if isinstance(tbr, (int, float)) else None
-        variants.append(VideoVariant(variant_url, quality_label, bitrate))
+        size_bytes = _optional_int(item.get("filesize")) or _optional_int(item.get("filesize_approx"))
+        variants.append(VideoVariant(variant_url, quality_label, bitrate, size_bytes))
     return variants
 
 
@@ -726,6 +748,14 @@ def _variant_quality_key(variant: VideoVariant) -> tuple[int, int]:
     )
 
 
+def _highest_resolution_key(variant: VideoVariant) -> tuple[int, int, int]:
+    return (
+        _resolution_height(variant.quality_label) or -1,
+        _resolution_pixels(variant.quality_label) or -1,
+        variant.bitrate if variant.bitrate is not None else -1,
+    )
+
+
 def pick_best_variant(
     variants: list[VideoVariant],
     preferred_height: int | None = None,
@@ -759,6 +789,25 @@ def pick_best_variant(
     return max(variants, key=_variant_quality_key)
 
 
+def pick_best_fitting_variant(
+    variants: list[VideoVariant],
+    max_size_bytes: int,
+    preferred_height: int,
+) -> VideoVariant | None:
+    fitting = [
+        variant
+        for variant in variants
+        if variant.size_bytes is not None and variant.size_bytes <= max_size_bytes
+    ]
+    if fitting:
+        return max(fitting, key=_highest_resolution_key)
+
+    unknown_size = [variant for variant in variants if variant.size_bytes is None]
+    if unknown_size:
+        return pick_best_variant(unknown_size, preferred_height=preferred_height)
+    return None
+
+
 def _providers_for_url(source_url: str):
     if _is_redgifs_url(source_url):
         return REDGIFS_PROVIDERS
@@ -773,6 +822,44 @@ def _preferred_height_for_url(source_url: str) -> int:
     if _is_eporner_url(source_url):
         return EPORNER_PREFERRED_VIDEO_HEIGHT
     return PREFERRED_VIDEO_HEIGHT
+
+
+CONTENT_RANGE_TOTAL_RE = re.compile(r"/(\d+)$")
+
+
+async def _probe_eporner_variant_sizes(
+    source_url: str,
+    variants: list[VideoVariant],
+    client: httpx.AsyncClient,
+) -> list[VideoVariant]:
+    logger = logging.getLogger("provider_eporner")
+    measured = []
+    for variant in variants:
+        if variant.size_bytes is not None:
+            measured.append(variant)
+            continue
+        try:
+            async with client.stream(
+                "GET",
+                variant.url,
+                headers={
+                    "User-Agent": USER_AGENT,
+                    "Referer": source_url,
+                    "Accept": "*/*",
+                    "Range": "bytes=0-0",
+                },
+            ) as response:
+                response.raise_for_status()
+                content_range = response.headers.get("Content-Range", "")
+                match = CONTENT_RANGE_TOTAL_RE.search(content_range)
+                size_bytes = int(match.group(1)) if match else None
+                if size_bytes is None and response.status_code == 200:
+                    size_bytes = _optional_int(response.headers.get("Content-Length"))
+                measured.append(variant._replace(size_bytes=size_bytes))
+        except Exception as exc:
+            logger.warning("variant size probe failed for %s: %s", variant.quality_label, exc)
+            measured.append(variant)
+    return measured
 
 
 async def download_best_video(source_url: str) -> Path | None:
@@ -791,10 +878,19 @@ async def download_best_video(source_url: str) -> Path | None:
             if not variants:
                 continue
 
-            best = pick_best_variant(
-                variants,
-                preferred_height=_preferred_height_for_url(source_url),
-            )
+            preferred_height = _preferred_height_for_url(source_url)
+            if _is_eporner_url(source_url):
+                variants = await _probe_eporner_variant_sizes(source_url, variants, client)
+                best = pick_best_fitting_variant(
+                    variants,
+                    max_size_bytes=MAX_VIDEO_SIZE_BYTES,
+                    preferred_height=preferred_height,
+                )
+                if best is None:
+                    logger.error("no Eporner variant fits the Telegram upload cap")
+                    continue
+            else:
+                best = pick_best_variant(variants, preferred_height=preferred_height)
             if not best.url.lower().startswith("https://"):
                 logger.warning("skipping non-HTTPS video URL from %s", provider_name)
                 continue
@@ -834,18 +930,8 @@ def _file_too_large_error(exc: TelegramError) -> bool:
 async def _send_video_or_document(ctx: ContextTypes.DEFAULT_TYPE, video_path: Path, source_url: str) -> bool:
     logger = logging.getLogger("handle_message")
     if video_path.stat().st_size > MAX_VIDEO_SIZE_BYTES:
-        logger.info("video exceeds send_video size cap; sending as document")
-        with video_path.open("rb") as document:
-            try:
-                await ctx.bot.send_document(
-                    chat_id=CHANNEL_ID,
-                    document=document,
-                    caption=source_url,
-                )
-                return True
-            except TelegramError as exc:
-                logger.error("send_document failed: %s", exc)
-                return False
+        logger.error("video exceeds Telegram upload cap; skipping upload")
+        return False
 
     with video_path.open("rb") as video:
         for attempt, delay in enumerate([1, 4, 16, None], start=1):
@@ -859,10 +945,14 @@ async def _send_video_or_document(ctx: ContextTypes.DEFAULT_TYPE, video_path: Pa
                 return True
             except BadRequest as exc:
                 if _file_too_large_error(exc):
-                    break
+                    logger.error("Telegram rejected video as too large: %s", exc)
+                    return False
                 logger.error("send_video failed: %s", exc)
                 return False
             except NetworkError as exc:
+                if _file_too_large_error(exc):
+                    logger.error("Telegram rejected video as too large: %s", exc)
+                    return False
                 if delay is None:
                     logger.error("send_video failed after retries: %s", exc)
                     return False
@@ -870,20 +960,12 @@ async def _send_video_or_document(ctx: ContextTypes.DEFAULT_TYPE, video_path: Pa
                 video.seek(0)
                 await asyncio.sleep(delay)
             except TelegramError as exc:
+                if _file_too_large_error(exc):
+                    logger.error("Telegram rejected video as too large: %s", exc)
+                    return False
                 logger.error("send_video failed: %s", exc)
                 return False
-
-    with video_path.open("rb") as document:
-        try:
-            await ctx.bot.send_document(
-                chat_id=CHANNEL_ID,
-                document=document,
-                caption=source_url,
-            )
-            return True
-        except TelegramError as exc:
-            logger.error("send_document failed: %s", exc)
-            return False
+    return False
 
 
 async def _alert_admin(ctx: ContextTypes.DEFAULT_TYPE, source_url: str) -> None:

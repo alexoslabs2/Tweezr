@@ -81,9 +81,9 @@ All runtime configuration comes from environment variables loaded via `python-do
 | `TELEGRAM_BOT_TOKEN` | yes | — | BotFather token |
 | `CHANNEL_ID` | yes | — | `-1001704658742` |
 | `DOWNLOAD_TIMEOUT_SECONDS` | no | `60` | Per-provider HTTP timeout |
-| `MAX_VIDEO_SIZE_MB` | no | `50` | Telegram sendVideo cap |
+| `MAX_VIDEO_SIZE_MB` | no | `50` | Telegram cloud Bot API upload cap |
 | `PREFERRED_VIDEO_HEIGHT` | no | `720` | Preferred short-edge video resolution |
-| `EPORNER_PREFERRED_VIDEO_HEIGHT` | no | `480` | Eporner-specific non-AV1 MP4 resolution preference |
+| `EPORNER_PREFERRED_VIDEO_HEIGHT` | no | `480` | Eporner fallback when size probing fails |
 | `REQUEST_USER_AGENT` | no | `Mozilla/5.0 (compatible; XVBOT/1.0)` | Outbound UA header |
 | `LOG_LEVEL` | no | `INFO` | Python logging level |
 | `LOG_DIR` | no | `/var/log/xvbot` | Log file directory |
@@ -125,9 +125,10 @@ async def provider_<name>(
 Return a list of `VideoVariant` objects on success, `None` or an empty list on failure. Never raise — catch all exceptions internally and return `None`.
 
 ```python
-VideoVariant = namedtuple("VideoVariant", ["url", "quality_label", "bitrate"])
+VideoVariant = namedtuple("VideoVariant", ["url", "quality_label", "bitrate", "size_bytes"])
 # bitrate: int (bps) or None if unknown
 # quality_label: str e.g. "1280x720" or "HD" or None
+# size_bytes: int or None if not reported or measured
 ```
 
 ### Provider List (in cascade order)
@@ -178,7 +179,7 @@ Never include cookies, Authorization headers, or X-specific tokens.
 
 Function: `pick_best_variant(variants: list[VideoVariant]) -> VideoVariant`
 
-Use `PREFERRED_VIDEO_HEIGHT=720` for Twitter/X and RedGifs. Use `EPORNER_PREFERRED_VIDEO_HEIGHT=480` for Eporner after filtering out AV1 formats. For each source, apply this priority chain:
+Use `PREFERRED_VIDEO_HEIGHT=720` for Twitter/X and RedGifs. For Eporner, filter AV1, probe every direct MP4 with `Range: bytes=0-0`, and select the highest measured resolution at or below `MAX_VIDEO_SIZE_MB`. Use `EPORNER_PREFERRED_VIDEO_HEIGHT=480` only among unknown-size variants when all probes fail. Other sources apply this priority chain:
 
 1. Exact preferred height, choosing the best bitrate when several variants match
 2. Highest available resolution below the preference
@@ -198,7 +199,8 @@ async def download_best_video(source_url: str) -> Path | None:
 ```
 
 - Use a single `httpx.AsyncClient` shared across all provider attempts for that message.
-- Once a provider returns variants, call `pick_best_variant`, then stream the video to `/tmp/xvbot_<uuid4_hex>.mp4`.
+- Once a provider returns variants, select a suitable variant, then stream the video to `/tmp/xvbot_<uuid4_hex>.mp4`.
+- For Eporner, measure sizes before the full download and never select a known oversized variant.
 - Stream in 32 KB chunks — do not load the whole file into memory.
 - Return the `Path` on success, `None` if all providers fail.
 - The temp file must not exist in the filesystem if this function returns `None`.
@@ -218,7 +220,8 @@ Sequence:
 3. Call `download_best_video`. If `None`, log ERROR + optionally alert admin; return.
 4. Upload:
    - Try `send_video` with `supports_streaming=True` and the tweet URL as `caption`.
-   - If Telegram rejects with file-too-large error, retry once with `send_document`.
+   - If the downloaded file exceeds `MAX_VIDEO_SIZE_MB`, do not attempt an upload.
+   - If Telegram rejects the file with HTTP 413, fail immediately without retrying.
    - If upload fails after retries, log ERROR; clean up temp file; return.
 5. Delete the original message with `delete_message`.
    - If delete fails, log WARNING and continue — the upload is already done.
@@ -237,7 +240,7 @@ Sequence:
 | All providers fail | Log `ERROR`; DM `ADMIN_CHAT_ID` if configured; return silently |
 | Download HTTP timeout | Counts as provider failure; move to next |
 | `send_video` network error | Retry 3× with backoff: 1s, 4s, 16s |
-| `send_video` file too large | Retry once with `send_document`; no further retries |
+| `send_video` HTTP 413/file too large | Permanent failure; do not retry or send as document |
 | `delete_message` fails | Log `WARNING`; do not retry |
 | Unhandled exception in handler | Log `CRITICAL` with full traceback; event loop must continue |
 
@@ -253,6 +256,7 @@ Sequence:
 - Also attach a `StreamHandler` at startup (useful for systemd journal).
 - Every log line must include: timestamp, level, and a short context string (e.g. `[provider_savetwt]`, `[handle_message]`).
 - Never log the bot token, the `.env` path contents, or raw HTTP response bodies.
+- Keep `httpx` and `httpcore` below INFO and apply token redaction filters to every handler.
 
 ---
 
@@ -282,7 +286,9 @@ Provide an offline test suite that:
 - Mocks `httpx.AsyncClient` responses and `yt-dlp` metadata for each provider.
 - Asserts that each provider returns a non-empty `list[VideoVariant]` given a known mock response.
 - Asserts that `pick_best_variant` uses the source-specific target and follows the documented lower/higher fallbacks.
-- Asserts that Eporner excludes AV1 and prefers a conventional 480p MP4.
+- Asserts that Eporner excludes AV1, measures variants, and chooses the highest MP4 under the upload cap.
+- Asserts that oversized files and HTTP 413 errors are not retried or sent as documents.
+- Asserts that configured tokens are redacted from logs.
 - Asserts that supported Twitter/X, RedGifs, and Eporner URL layouts are recognized.
 - Does **not** make real network calls — every test must pass with no internet connection.
 

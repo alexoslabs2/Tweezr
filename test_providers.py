@@ -1,4 +1,5 @@
 import os
+import logging
 from types import SimpleNamespace
 
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "test-token")
@@ -11,11 +12,26 @@ import bot
 
 
 class MockResponse:
-    def __init__(self, json_data=None, text="", url="https://provider.test/response"):
+    def __init__(
+        self,
+        json_data=None,
+        text="",
+        url="https://provider.test/response",
+        headers=None,
+        status_code=200,
+    ):
         self._json_data = json_data
         self.text = text
         self.url = url
+        self.headers = headers or {}
+        self.status_code = status_code
         self.history = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return False
 
     def json(self):
         return self._json_data
@@ -50,6 +66,10 @@ class MockAsyncClient:
 
     async def head(self, url, **kwargs):
         self.requests.append(("HEAD", url, kwargs))
+        return self._next_response()
+
+    def stream(self, method, url, **kwargs):
+        self.requests.append((method, url, kwargs))
         return self._next_response()
 
 
@@ -377,6 +397,61 @@ def test_pick_best_variant_accepts_source_specific_height():
     )
 
 
+def test_pick_best_fitting_variant_uses_highest_resolution_under_cap():
+    variants = [
+        bot.VideoVariant("https://cdn.example/240.mp4", "240p", None, 31_000_000),
+        bot.VideoVariant("https://cdn.example/360.mp4", "360p", None, 58_000_000),
+        bot.VideoVariant("https://cdn.example/480.mp4", "480p", None, 112_000_000),
+    ]
+
+    best = bot.pick_best_fitting_variant(
+        variants,
+        max_size_bytes=50 * 1024 * 1024,
+        preferred_height=480,
+    )
+
+    assert best.url == "https://cdn.example/240.mp4"
+
+
+def test_pick_best_fitting_variant_returns_none_when_every_known_variant_is_too_large():
+    variants = [
+        bot.VideoVariant("https://cdn.example/360.mp4", "360p", None, 58_000_000),
+        bot.VideoVariant("https://cdn.example/480.mp4", "480p", None, 112_000_000),
+    ]
+
+    assert (
+        bot.pick_best_fitting_variant(
+            variants,
+            max_size_bytes=50 * 1024 * 1024,
+            preferred_height=480,
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_probe_eporner_variant_sizes_uses_one_byte_ranges():
+    variants = [
+        bot.VideoVariant("https://cdn.example/240.mp4", "240p", None),
+        bot.VideoVariant("https://cdn.example/480.mp4", "480p", None),
+    ]
+    client = MockAsyncClient(
+        [
+            MockResponse(headers={"Content-Range": "bytes 0-0/31029784"}, status_code=206),
+            MockResponse(headers={"Content-Range": "bytes 0-0/112438476"}, status_code=206),
+        ]
+    )
+
+    measured = await bot._probe_eporner_variant_sizes(
+        "https://www.eporner.com/video-AbC123/example/",
+        variants,
+        client,
+    )
+
+    assert [variant.size_bytes for variant in measured] == [31_029_784, 112_438_476]
+    assert all(request[2]["headers"]["Range"] == "bytes=0-0" for request in client.requests)
+
+
 def test_pick_best_variant_uses_resolution_when_bitrate_unknown():
     variants = [
         bot.VideoVariant("https://cdn.example/480.mp4", "854x480", None),
@@ -468,7 +543,7 @@ def test_eporner_uses_source_specific_480p_preference():
 
 
 @pytest.mark.asyncio
-async def test_send_video_or_document_skips_send_video_when_file_exceeds_cap(tmp_path, monkeypatch):
+async def test_send_video_or_document_rejects_file_exceeding_upload_cap(tmp_path, monkeypatch):
     class MockBot:
         def __init__(self):
             self.video_calls = 0
@@ -491,6 +566,52 @@ async def test_send_video_or_document_skips_send_video_when_file_exceeds_cap(tmp
         "https://www.redgifs.com/watch/example",
     )
 
-    assert uploaded is True
+    assert uploaded is False
     assert mock_bot.video_calls == 0
-    assert mock_bot.document_calls == 1
+    assert mock_bot.document_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_send_video_does_not_retry_network_error_413(tmp_path):
+    class MockBot:
+        def __init__(self):
+            self.video_calls = 0
+            self.document_calls = 0
+
+        async def send_video(self, **kwargs):
+            self.video_calls += 1
+            raise bot.NetworkError("Request Entity Too Large (413)")
+
+        async def send_document(self, **kwargs):
+            self.document_calls += 1
+
+    video_path = tmp_path / "video.mp4"
+    video_path.write_bytes(b"video")
+    mock_bot = MockBot()
+
+    uploaded = await bot._send_video_or_document(
+        SimpleNamespace(bot=mock_bot),
+        video_path,
+        "https://www.eporner.com/video-AbC123/example/",
+    )
+
+    assert uploaded is False
+    assert mock_bot.video_calls == 1
+    assert mock_bot.document_calls == 0
+
+
+def test_logging_redacts_telegram_token_and_suppresses_http_request_logs():
+    record = logging.LogRecord(
+        "httpx",
+        logging.INFO,
+        __file__,
+        1,
+        f"POST https://api.telegram.org/bot{bot.TOKEN}/getMe",
+        (),
+        None,
+    )
+
+    assert bot._secret_filter.filter(record) is True
+    assert bot.TOKEN not in record.getMessage()
+    assert "<redacted>" in record.getMessage()
+    assert logging.getLogger("httpx").level == logging.WARNING
