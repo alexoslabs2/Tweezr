@@ -83,6 +83,7 @@ All runtime configuration comes from environment variables loaded via `python-do
 | `DOWNLOAD_TIMEOUT_SECONDS` | no | `60` | Per-provider HTTP timeout |
 | `MAX_VIDEO_SIZE_MB` | no | `50` | Telegram sendVideo cap |
 | `PREFERRED_VIDEO_HEIGHT` | no | `720` | Preferred short-edge video resolution |
+| `EPORNER_PREFERRED_VIDEO_HEIGHT` | no | `480` | Eporner-specific non-AV1 MP4 resolution preference |
 | `REQUEST_USER_AGENT` | no | `Mozilla/5.0 (compatible; XVBOT/1.0)` | Outbound UA header |
 | `LOG_LEVEL` | no | `INFO` | Python logging level |
 | `LOG_DIR` | no | `/var/log/xvbot` | Log file directory |
@@ -156,7 +157,7 @@ RedGifs URLs route only to `provider_redgifs`. Eporner URLs route only to `provi
 
 **`provider_getxbot`** — POST `Content-Type: application/json` body `{"url": tweet_url}`. Parse `result.videos[]`; each has `url` and `bitrate`.
 
-**`provider_eporner`** — Run `yt-dlp` metadata extraction in a dedicated daemon worker thread, no cookies, no authentication, no cache, and no file download. Poll thread completion asynchronously so extraction never blocks the event loop. Upgrade extractor traffic and returned media URLs to HTTPS, then return only direct MP4 video variants. HLS manifests and video-only/audio-only variants are excluded from the existing direct-file streamer.
+**`provider_eporner`** — Run `yt-dlp` metadata extraction in a dedicated daemon worker thread, no cookies, no authentication, no cache, and no file download. Poll thread completion asynchronously so extraction never blocks the event loop. Upgrade extractor traffic and returned media URLs to HTTPS, then return only direct conventional MP4 video variants. HLS manifests, AV1 variants, and video-only/audio-only variants are excluded from the existing direct-file streamer so Telegram can play the result inline.
 
 ### Required Headers for All Provider Requests
 
@@ -177,7 +178,7 @@ Never include cookies, Authorization headers, or X-specific tokens.
 
 Function: `pick_best_variant(variants: list[VideoVariant]) -> VideoVariant`
 
-With `PREFERRED_VIDEO_HEIGHT=720`, use the following priority chain:
+Use `PREFERRED_VIDEO_HEIGHT=720` for Twitter/X and RedGifs. Use `EPORNER_PREFERRED_VIDEO_HEIGHT=480` for Eporner after filtering out AV1 formats. For each source, apply this priority chain:
 
 1. Exact preferred height, choosing the best bitrate when several variants match
 2. Highest available resolution below the preference
@@ -280,7 +281,8 @@ Provide an offline test suite that:
 
 - Mocks `httpx.AsyncClient` responses and `yt-dlp` metadata for each provider.
 - Asserts that each provider returns a non-empty `list[VideoVariant]` given a known mock response.
-- Asserts that `pick_best_variant` prefers 720p and follows the documented lower/higher fallbacks.
+- Asserts that `pick_best_variant` uses the source-specific target and follows the documented lower/higher fallbacks.
+- Asserts that Eporner excludes AV1 and prefers a conventional 480p MP4.
 - Asserts that supported Twitter/X, RedGifs, and Eporner URL layouts are recognized.
 - Does **not** make real network calls — every test must pass with no internet connection.
 

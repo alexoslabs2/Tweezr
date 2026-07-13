@@ -38,6 +38,7 @@ CHANNEL_ID = int(_required_env("CHANNEL_ID"))
 DOWNLOAD_TIMEOUT_SECONDS = int(os.getenv("DOWNLOAD_TIMEOUT_SECONDS", "60"))
 MAX_VIDEO_SIZE_MB = int(os.getenv("MAX_VIDEO_SIZE_MB", "50"))
 PREFERRED_VIDEO_HEIGHT = int(os.getenv("PREFERRED_VIDEO_HEIGHT", "720"))
+EPORNER_PREFERRED_VIDEO_HEIGHT = int(os.getenv("EPORNER_PREFERRED_VIDEO_HEIGHT", "480"))
 USER_AGENT = os.getenv("REQUEST_USER_AGENT", "Mozilla/5.0 (compatible; XVBOT/1.0)")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 LOG_DIR = Path(os.getenv("LOG_DIR", "/var/log/xvbot"))
@@ -340,10 +341,15 @@ def _extract_eporner_variants(eporner_url: str) -> list[VideoVariant]:
             continue
         if item.get("ext") not in (None, "mp4"):
             continue
-        if item.get("vcodec") == "none" or item.get("acodec") == "none":
+        vcodec = item.get("vcodec")
+        if vcodec == "none" or item.get("acodec") == "none":
             continue
 
         raw_url = item.get("url")
+        normalized_vcodec = vcodec.lower() if isinstance(vcodec, str) else ""
+        raw_path = urlparse(raw_url).path.lower() if isinstance(raw_url, str) else ""
+        if normalized_vcodec.startswith(("av1", "av01")) or "-av1." in raw_path:
+            continue
         variant_url = _https_variant_url(_https_url(raw_url)) if isinstance(raw_url, str) else None
         if not variant_url or variant_url in seen_urls:
             continue
@@ -720,17 +726,21 @@ def _variant_quality_key(variant: VideoVariant) -> tuple[int, int]:
     )
 
 
-def pick_best_variant(variants: list[VideoVariant]) -> VideoVariant:
+def pick_best_variant(
+    variants: list[VideoVariant],
+    preferred_height: int | None = None,
+) -> VideoVariant:
+    target_height = PREFERRED_VIDEO_HEIGHT if preferred_height is None else preferred_height
     variants_by_height = [
         (variant, _resolution_height(variant.quality_label))
         for variant in variants
         if _resolution_height(variant.quality_label) is not None
     ]
-    exact = [variant for variant, height in variants_by_height if height == PREFERRED_VIDEO_HEIGHT]
+    exact = [variant for variant, height in variants_by_height if height == target_height]
     if exact:
         return max(exact, key=_variant_quality_key)
 
-    below = [(variant, height) for variant, height in variants_by_height if height < PREFERRED_VIDEO_HEIGHT]
+    below = [(variant, height) for variant, height in variants_by_height if height < target_height]
     if below:
         best_height = max(height for _, height in below)
         return max(
@@ -738,7 +748,7 @@ def pick_best_variant(variants: list[VideoVariant]) -> VideoVariant:
             key=_variant_quality_key,
         )
 
-    above = [(variant, height) for variant, height in variants_by_height if height > PREFERRED_VIDEO_HEIGHT]
+    above = [(variant, height) for variant, height in variants_by_height if height > target_height]
     if above:
         best_height = min(height for _, height in above)
         return max(
@@ -759,6 +769,12 @@ def _providers_for_url(source_url: str):
     return []
 
 
+def _preferred_height_for_url(source_url: str) -> int:
+    if _is_eporner_url(source_url):
+        return EPORNER_PREFERRED_VIDEO_HEIGHT
+    return PREFERRED_VIDEO_HEIGHT
+
+
 async def download_best_video(source_url: str) -> Path | None:
     logger = logging.getLogger("download_best_video")
     providers = _providers_for_url(source_url)
@@ -775,7 +791,10 @@ async def download_best_video(source_url: str) -> Path | None:
             if not variants:
                 continue
 
-            best = pick_best_variant(variants)
+            best = pick_best_variant(
+                variants,
+                preferred_height=_preferred_height_for_url(source_url),
+            )
             if not best.url.lower().startswith("https://"):
                 logger.warning("skipping non-HTTPS video URL from %s", provider_name)
                 continue

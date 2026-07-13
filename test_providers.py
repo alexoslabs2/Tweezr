@@ -270,6 +270,21 @@ async def test_provider_eporner_returns_direct_mp4_variants(monkeypatch):
                     "height": 1080,
                 },
                 {
+                    "url": "https://cdn.example/video-480-av1.mp4",
+                    "protocol": "https",
+                    "ext": "mp4",
+                    "width": 854,
+                    "height": 480,
+                    "vcodec": "av1",
+                },
+                {
+                    "url": "https://cdn.example/video-720-av1.mp4",
+                    "protocol": "https",
+                    "ext": "mp4",
+                    "width": 1280,
+                    "height": 720,
+                },
+                {
                     "url": "https://cdn.example/playlist.m3u8",
                     "protocol": "m3u8_native",
                     "ext": "mp4",
@@ -348,6 +363,18 @@ def test_pick_best_variant_honors_configured_height(monkeypatch):
     ]
 
     assert bot.pick_best_variant(variants).url == "https://cdn.example/480.mp4"
+
+
+def test_pick_best_variant_accepts_source_specific_height():
+    variants = [
+        bot.VideoVariant("https://cdn.example/480.mp4", "854x480", 500000),
+        bot.VideoVariant("https://cdn.example/720.mp4", "1280x720", 1000000),
+    ]
+
+    assert (
+        bot.pick_best_variant(variants, preferred_height=480).url
+        == "https://cdn.example/480.mp4"
+    )
 
 
 def test_pick_best_variant_uses_resolution_when_bitrate_unknown():
@@ -430,6 +457,14 @@ def test_provider_routing_uses_dedicated_eporner_provider():
     assert bot._providers_for_url("https://www.eporner.com/video-AbC123/example/") == [
         bot.provider_eporner
     ]
+
+
+def test_eporner_uses_source_specific_480p_preference():
+    assert (
+        bot._preferred_height_for_url("https://www.eporner.com/video-AbC123/example/")
+        == 480
+    )
+    assert bot._preferred_height_for_url("https://x.com/example/status/123") == 720
 
 
 @pytest.mark.asyncio

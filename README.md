@@ -23,7 +23,7 @@ cp .env.example .env
 
 Then fill in `TELEGRAM_BOT_TOKEN` and `CHANNEL_ID`.
 
-Video selection defaults to 720p through `PREFERRED_VIDEO_HEIGHT=720`. When an exact match is unavailable, Tweezr chooses the best lower resolution, then the smallest higher resolution. Eporner extraction uses `yt-dlp`, runs in a dedicated worker thread outside the async event loop, and accepts public video URLs without cookies or authentication.
+X and RedGifs selection defaults to 720p through `PREFERRED_VIDEO_HEIGHT=720`. Eporner uses `EPORNER_PREFERRED_VIDEO_HEIGHT=480` and excludes AV1 variants so Telegram receives the smaller conventional MP4 format for inline playback. When an exact match is unavailable, Tweezr chooses the best lower resolution, then the smallest higher resolution. Eporner extraction uses `yt-dlp`, runs in a dedicated worker thread outside the async event loop, and accepts public video URLs without cookies or authentication.
 
 ## Local Test
 
