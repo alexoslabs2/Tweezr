@@ -1,6 +1,6 @@
 # Tweezr
 
-Tweezr is a long-lived Telegram bot that watches one private channel for X/Twitter status URLs and RedGifs watch URLs, downloads the best available video, reposts the video into the same channel, and deletes the original URL message.
+Tweezr is a long-lived Telegram bot that watches one private channel for X/Twitter status URLs, RedGifs watch URLs, and Eporner video URLs. It downloads the preferred video variant, reposts it into the same channel, and deletes the original URL message.
 
 ## Files
 
@@ -22,6 +22,8 @@ cp .env.example .env
 ```
 
 Then fill in `TELEGRAM_BOT_TOKEN` and `CHANNEL_ID`.
+
+Video selection defaults to 720p through `PREFERRED_VIDEO_HEIGHT=720`. When an exact match is unavailable, Tweezr chooses the best lower resolution, then the smallest higher resolution. Eporner extraction uses `yt-dlp`, runs in a dedicated worker thread outside the async event loop, and accepts public video URLs without cookies or authentication.
 
 ## Local Test
 

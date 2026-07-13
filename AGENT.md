@@ -1,4 +1,4 @@
-# AGENT.md — Telegram X/Twitter Video Bot
+# AGENT.md — Telegram Multi-Source Video Bot
 
 This file is the authoritative instruction set for any AI coding agent working on this project. Read it fully before writing any code or making any structural decision.
 
@@ -6,7 +6,7 @@ This file is the authoritative instruction set for any AI coding agent working o
 
 ## Project Purpose
 
-Build a long-lived Python service that watches a single private Telegram channel (`-1001704658742`) for Twitter/X post URLs, downloads the best-resolution video anonymously using a cascade of public scraping endpoints, re-posts the video file into the same channel, and deletes the original URL message. No web UI. No commands. No user interaction beyond pasting a URL.
+Build a long-lived Python service that watches a single private Telegram channel (`-1001704658742`) for Twitter/X, RedGifs, and Eporner video URLs, downloads the preferred-resolution video anonymously, re-posts the video file into the same channel, and deletes the original URL message. No web UI. No commands. No user interaction beyond pasting a URL.
 
 ---
 
@@ -63,7 +63,10 @@ httpx==0.27.*
 beautifulsoup4==4.12.*
 lxml==5.*
 python-dotenv==1.*
+yt-dlp==2026.7.*
 ```
+
+`yt-dlp` supplies the maintained Eporner extractor. Tweezr wraps its network path to upgrade HTTP URLs to HTTPS and filters its output to direct MP4 variants compatible with the existing streamer.
 
 Pin to minor version (`==X.Y.*`). Never use `>=` or unpinned installs.
 
@@ -79,6 +82,7 @@ All runtime configuration comes from environment variables loaded via `python-do
 | `CHANNEL_ID` | yes | — | `-1001704658742` |
 | `DOWNLOAD_TIMEOUT_SECONDS` | no | `60` | Per-provider HTTP timeout |
 | `MAX_VIDEO_SIZE_MB` | no | `50` | Telegram sendVideo cap |
+| `PREFERRED_VIDEO_HEIGHT` | no | `720` | Preferred short-edge video resolution |
 | `REQUEST_USER_AGENT` | no | `Mozilla/5.0 (compatible; XVBOT/1.0)` | Outbound UA header |
 | `LOG_LEVEL` | no | `INFO` | Python logging level |
 | `LOG_DIR` | no | `/var/log/xvbot` | Log file directory |
@@ -98,7 +102,8 @@ TWITTER_URL_RE = re.compile(
 ```
 
 - Apply to `message.text` only (not captions, not forwarded media).
-- If `t.co` short-links are present, resolve them with a single async HEAD request before passing to the cascade. Follow redirects until a `twitter.com` or `x.com` URL is found or the chain ends.
+- Recognize public Eporner `/hd-porn/<id>`, `/embed/<id>`, and `/video-<id>` URL layouts in addition to Twitter/X and RedGifs URLs.
+- If `t.co` short-links are present, resolve them with a single async HEAD request before passing to the matching source provider. Follow redirects until a supported URL is found or the chain ends.
 - Return the first URL match; ignore subsequent URLs in the same message.
 
 ---
@@ -111,7 +116,7 @@ Every provider is an async function with this exact signature:
 
 ```python
 async def provider_<name>(
-    tweet_url: str,
+    source_url: str,
     client: httpx.AsyncClient,
 ) -> list[VideoVariant] | None:
 ```
@@ -135,6 +140,8 @@ VideoVariant = namedtuple("VideoVariant", ["url", "quality_label", "bitrate"])
 | 5 | `provider_twmate` | `POST https://twmate.com/en2/` |
 | 6 | `provider_getxbot` | `POST https://www.getxbot.com/` |
 
+RedGifs URLs route only to `provider_redgifs`. Eporner URLs route only to `provider_eporner`; Twitter/X URLs use the six-provider cascade above.
+
 ### Per-provider Implementation Notes
 
 **`provider_savetwt`** — POST form-encoded `url=<tweet>`. Parse JSON response; extract `links` array. Each item has `url`, `quality`, and optionally `size`.
@@ -148,6 +155,8 @@ VideoVariant = namedtuple("VideoVariant", ["url", "quality_label", "bitrate"])
 **`provider_twmate`** — POST form-encoded `url=<tweet>`. Parse `video_data` JSON blob from response for video variants.
 
 **`provider_getxbot`** — POST `Content-Type: application/json` body `{"url": tweet_url}`. Parse `result.videos[]`; each has `url` and `bitrate`.
+
+**`provider_eporner`** — Run `yt-dlp` metadata extraction in a dedicated daemon worker thread, no cookies, no authentication, no cache, and no file download. Poll thread completion asynchronously so extraction never blocks the event loop. Upgrade extractor traffic and returned media URLs to HTTPS, then return only direct MP4 video variants. HLS manifests and video-only/audio-only variants are excluded from the existing direct-file streamer.
 
 ### Required Headers for All Provider Requests
 
@@ -168,11 +177,14 @@ Never include cookies, Authorization headers, or X-specific tokens.
 
 Function: `pick_best_variant(variants: list[VideoVariant]) -> VideoVariant`
 
-Priority chain — highest priority first:
+With `PREFERRED_VIDEO_HEIGHT=720`, use the following priority chain:
 
-1. Highest numeric `bitrate` (when not `None`)
-2. Highest resolution parsed from `quality_label` (e.g. `1280x720` → `1280 * 720 = 921600` pixels)
-3. First item in list (last resort)
+1. Exact preferred height, choosing the best bitrate when several variants match
+2. Highest available resolution below the preference
+3. Smallest available resolution above the preference
+4. Highest bitrate when dimensions are unavailable
+
+For portrait media, the shorter dimension is treated as the resolution tier, so `720x1280` is considered 720p.
 
 ---
 
@@ -181,7 +193,7 @@ Priority chain — highest priority first:
 `download_best_video` orchestrates the cascade:
 
 ```python
-async def download_best_video(tweet_url: str) -> Path | None:
+async def download_best_video(source_url: str) -> Path | None:
 ```
 
 - Use a single `httpx.AsyncClient` shared across all provider attempts for that message.
@@ -201,7 +213,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 Sequence:
 
 1. Guard: `update.channel_post` must exist and have `.text`.
-2. Extract tweet URL — return silently if none found.
+2. Extract the first supported source URL — return silently if none found.
 3. Call `download_best_video`. If `None`, log ERROR + optionally alert admin; return.
 4. Upload:
    - Try `send_video` with `supports_streaming=True` and the tweet URL as `caption`.
@@ -266,10 +278,10 @@ app.run_polling(drop_pending_updates=True)
 
 Provide an offline test suite that:
 
-- Mocks `httpx.AsyncClient` responses for each provider.
+- Mocks `httpx.AsyncClient` responses and `yt-dlp` metadata for each provider.
 - Asserts that each provider returns a non-empty `list[VideoVariant]` given a known mock response.
-- Asserts that `pick_best_variant` returns the highest-bitrate item.
-- Asserts that `extract_tweet_url` matches valid URLs and rejects non-matching strings.
+- Asserts that `pick_best_variant` prefers 720p and follows the documented lower/higher fallbacks.
+- Asserts that supported Twitter/X, RedGifs, and Eporner URL layouts are recognized.
 - Does **not** make real network calls — every test must pass with no internet connection.
 
 Use `pytest` + `pytest-asyncio`. No additional test dependencies.

@@ -5,10 +5,12 @@ import json
 import logging
 import os
 import re
+import threading
 from collections import namedtuple
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from urllib.parse import urlparse
+from urllib.request import Request as UrllibRequest
 from uuid import uuid4
 
 import httpx
@@ -17,6 +19,8 @@ from dotenv import load_dotenv
 from telegram import Update
 from telegram.error import BadRequest, NetworkError, TelegramError
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
+from yt_dlp import YoutubeDL
+from yt_dlp.networking import Request as YtDlpRequest
 
 
 load_dotenv("/etc/xvbot/.env")
@@ -33,6 +37,7 @@ TOKEN = _required_env("TELEGRAM_BOT_TOKEN")
 CHANNEL_ID = int(_required_env("CHANNEL_ID"))
 DOWNLOAD_TIMEOUT_SECONDS = int(os.getenv("DOWNLOAD_TIMEOUT_SECONDS", "60"))
 MAX_VIDEO_SIZE_MB = int(os.getenv("MAX_VIDEO_SIZE_MB", "50"))
+PREFERRED_VIDEO_HEIGHT = int(os.getenv("PREFERRED_VIDEO_HEIGHT", "720"))
 USER_AGENT = os.getenv("REQUEST_USER_AGENT", "Mozilla/5.0 (compatible; XVBOT/1.0)")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 LOG_DIR = Path(os.getenv("LOG_DIR", "/var/log/xvbot"))
@@ -74,6 +79,13 @@ REDGIFS_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+EPORNER_URL_RE = re.compile(
+    r"https?://(www\.)?eporner\.com/"
+    r"(?:(?:hd-porn|embed)/[A-Za-z0-9_]+|video-[A-Za-z0-9_]+)"
+    r"(?:/[A-Za-z0-9_-]+)?/?",
+    re.IGNORECASE,
+)
+
 
 def _https_url(url: str) -> str:
     if url.lower().startswith("http://"):
@@ -90,6 +102,13 @@ def extract_tweet_url(text: str) -> str | None:
 
 def extract_redgifs_url(text: str) -> str | None:
     match = REDGIFS_URL_RE.search(text)
+    if not match:
+        return None
+    return _https_url(match.group(0))
+
+
+def extract_eporner_url(text: str) -> str | None:
+    match = EPORNER_URL_RE.search(text)
     if not match:
         return None
     return _https_url(match.group(0))
@@ -130,6 +149,7 @@ def extract_supported_url(text: str) -> str | None:
         for match in (
             TWITTER_URL_RE.search(text),
             REDGIFS_URL_RE.search(text),
+            EPORNER_URL_RE.search(text),
         )
         if match
     ]
@@ -142,12 +162,17 @@ def _is_redgifs_url(url: str) -> bool:
     return REDGIFS_URL_RE.fullmatch(url) is not None
 
 
+def _is_eporner_url(url: str) -> bool:
+    return EPORNER_URL_RE.fullmatch(url) is not None
+
+
 async def extract_message_source_url(text: str, client: httpx.AsyncClient) -> str | None:
     matches = [
         match
         for match in (
             TWITTER_URL_RE.search(text),
             REDGIFS_URL_RE.search(text),
+            EPORNER_URL_RE.search(text),
             TCO_URL_RE.search(text),
         )
         if match
@@ -264,6 +289,103 @@ async def provider_redgifs(
                     bitrate=None,
                 )
             )
+        return variants or None
+    except Exception as exc:
+        logger.warning("provider failed: %s", exc)
+        return None
+
+
+class _HttpsOnlyYoutubeDL(YoutubeDL):
+    def urlopen(self, request):
+        if isinstance(request, str):
+            request = _https_url(request)
+        elif isinstance(request, YtDlpRequest):
+            request.update(url=_https_url(request.url))
+        elif isinstance(request, UrllibRequest) and request.full_url.lower().startswith("http://"):
+            request = UrllibRequest(
+                _https_url(request.full_url),
+                data=request.data,
+                headers=dict(request.headers),
+                method=request.get_method(),
+            )
+        return super().urlopen(request)
+
+
+def _extract_eporner_variants(eporner_url: str) -> list[VideoVariant]:
+    options = {
+        "cachedir": False,
+        "extractor_retries": 1,
+        "fragment_retries": 1,
+        "http_headers": {"User-Agent": USER_AGENT},
+        "noplaylist": True,
+        "no_warnings": True,
+        "quiet": True,
+        "retries": 1,
+        "skip_download": True,
+        "socket_timeout": DOWNLOAD_TIMEOUT_SECONDS,
+    }
+    with _HttpsOnlyYoutubeDL(options) as downloader:
+        info = downloader.extract_info(eporner_url, download=False)
+
+    if not isinstance(info, dict):
+        return []
+
+    variants = []
+    seen_urls = set()
+    for item in info.get("formats") or []:
+        if not isinstance(item, dict):
+            continue
+        protocol = item.get("protocol")
+        if protocol not in (None, "http", "https"):
+            continue
+        if item.get("ext") not in (None, "mp4"):
+            continue
+        if item.get("vcodec") == "none" or item.get("acodec") == "none":
+            continue
+
+        raw_url = item.get("url")
+        variant_url = _https_variant_url(_https_url(raw_url)) if isinstance(raw_url, str) else None
+        if not variant_url or variant_url in seen_urls:
+            continue
+        seen_urls.add(variant_url)
+
+        width = _optional_int(item.get("width"))
+        height = _optional_int(item.get("height"))
+        if width and height:
+            quality_label = f"{width}x{height}"
+        elif height:
+            quality_label = f"{height}p"
+        else:
+            quality_label = item.get("format_note") if isinstance(item.get("format_note"), str) else None
+
+        tbr = item.get("tbr")
+        bitrate = int(tbr * 1000) if isinstance(tbr, (int, float)) else None
+        variants.append(VideoVariant(variant_url, quality_label, bitrate))
+    return variants
+
+
+async def provider_eporner(
+    eporner_url: str,
+    client: httpx.AsyncClient,
+) -> list[VideoVariant] | None:
+    del client
+    logger = logging.getLogger("provider_eporner")
+    try:
+        result = {}
+
+        def extract():
+            try:
+                result["variants"] = _extract_eporner_variants(eporner_url)
+            except Exception as exc:
+                result["exception"] = exc
+
+        worker = threading.Thread(target=extract, name="eporner-extractor", daemon=True)
+        worker.start()
+        while worker.is_alive():
+            await asyncio.sleep(0.05)
+        if "exception" in result:
+            raise result["exception"]
+        variants = result.get("variants", [])
         return variants or None
     except Exception as exc:
         logger.warning("provider failed: %s", exc)
@@ -562,8 +684,13 @@ REDGIFS_PROVIDERS = [
     provider_redgifs,
 ]
 
+EPORNER_PROVIDERS = [
+    provider_eporner,
+]
+
 
 RESOLUTION_RE = re.compile(r"(\d{2,5})\s*[xX]\s*(\d{2,5})")
+HEIGHT_RE = re.compile(r"(\d{2,5})\s*[pP]")
 
 
 def _resolution_pixels(quality_label: str | None) -> int | None:
@@ -575,29 +702,66 @@ def _resolution_pixels(quality_label: str | None) -> int | None:
     return int(match.group(1)) * int(match.group(2))
 
 
+def _resolution_height(quality_label: str | None) -> int | None:
+    if not quality_label:
+        return None
+    match = RESOLUTION_RE.search(quality_label)
+    if match:
+        width, height = int(match.group(1)), int(match.group(2))
+        return min(width, height)
+    match = HEIGHT_RE.search(quality_label)
+    return int(match.group(1)) if match else None
+
+
+def _variant_quality_key(variant: VideoVariant) -> tuple[int, int]:
+    return (
+        variant.bitrate if variant.bitrate is not None else -1,
+        _resolution_pixels(variant.quality_label) or -1,
+    )
+
+
 def pick_best_variant(variants: list[VideoVariant]) -> VideoVariant:
-    for variant in sorted(
-        variants,
-        key=lambda item: item.bitrate if item.bitrate is not None else -1,
-        reverse=True,
-    ):
-        if variant.bitrate is not None:
-            return variant
+    variants_by_height = [
+        (variant, _resolution_height(variant.quality_label))
+        for variant in variants
+        if _resolution_height(variant.quality_label) is not None
+    ]
+    exact = [variant for variant, height in variants_by_height if height == PREFERRED_VIDEO_HEIGHT]
+    if exact:
+        return max(exact, key=_variant_quality_key)
 
-    for variant in sorted(
-        variants,
-        key=lambda item: _resolution_pixels(item.quality_label) or -1,
-        reverse=True,
-    ):
-        if _resolution_pixels(variant.quality_label) is not None:
-            return variant
+    below = [(variant, height) for variant, height in variants_by_height if height < PREFERRED_VIDEO_HEIGHT]
+    if below:
+        best_height = max(height for _, height in below)
+        return max(
+            (variant for variant, height in below if height == best_height),
+            key=_variant_quality_key,
+        )
 
-    return variants[0]
+    above = [(variant, height) for variant, height in variants_by_height if height > PREFERRED_VIDEO_HEIGHT]
+    if above:
+        best_height = min(height for _, height in above)
+        return max(
+            (variant for variant, height in above if height == best_height),
+            key=_variant_quality_key,
+        )
+
+    return max(variants, key=_variant_quality_key)
+
+
+def _providers_for_url(source_url: str):
+    if _is_redgifs_url(source_url):
+        return REDGIFS_PROVIDERS
+    if _is_eporner_url(source_url):
+        return EPORNER_PROVIDERS
+    if TWITTER_URL_RE.fullmatch(source_url):
+        return PROVIDERS
+    return []
 
 
 async def download_best_video(source_url: str) -> Path | None:
     logger = logging.getLogger("download_best_video")
-    providers = REDGIFS_PROVIDERS if _is_redgifs_url(source_url) else PROVIDERS
+    providers = _providers_for_url(source_url)
     timeout = httpx.Timeout(DOWNLOAD_TIMEOUT_SECONDS)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
         for provider in providers:

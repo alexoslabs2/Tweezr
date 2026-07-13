@@ -247,7 +247,61 @@ async def test_provider_redgifs_returns_variants():
     assert client.requests[1][2]["headers"]["Authorization"] == "Bearer temp-token"
 
 
-def test_pick_best_variant_prefers_highest_bitrate():
+@pytest.mark.asyncio
+async def test_provider_eporner_returns_direct_mp4_variants(monkeypatch):
+    def fake_extract_info(self, url, download):
+        assert url == "https://www.eporner.com/video-AbC123/example-video/"
+        assert download is False
+        return {
+            "formats": [
+                {
+                    "url": "http://cdn.example/video-720.mp4",
+                    "protocol": "https",
+                    "ext": "mp4",
+                    "width": 1280,
+                    "height": 720,
+                    "tbr": 1500.5,
+                },
+                {
+                    "url": "https://cdn.example/video-1080.mp4",
+                    "protocol": "https",
+                    "ext": "mp4",
+                    "width": 1920,
+                    "height": 1080,
+                },
+                {
+                    "url": "https://cdn.example/playlist.m3u8",
+                    "protocol": "m3u8_native",
+                    "ext": "mp4",
+                    "height": 720,
+                },
+            ]
+        }
+
+    monkeypatch.setattr(bot._HttpsOnlyYoutubeDL, "extract_info", fake_extract_info)
+
+    variants = await bot.provider_eporner(
+        "https://www.eporner.com/video-AbC123/example-video/",
+        MockAsyncClient(MockResponse()),
+    )
+
+    assert variants == [
+        bot.VideoVariant("https://cdn.example/video-720.mp4", "1280x720", 1500500),
+        bot.VideoVariant("https://cdn.example/video-1080.mp4", "1920x1080", None),
+    ]
+
+
+def test_eporner_extractor_upgrades_internal_requests_to_https(monkeypatch):
+    monkeypatch.setattr(bot.YoutubeDL, "urlopen", lambda self, request: request)
+    downloader = object.__new__(bot._HttpsOnlyYoutubeDL)
+    request = bot.YtDlpRequest("http://www.eporner.com/xhr/video/AbC123")
+
+    upgraded = downloader.urlopen(request)
+
+    assert upgraded.url == "https://www.eporner.com/xhr/video/AbC123"
+
+
+def test_pick_best_variant_prefers_720p_over_higher_bitrate():
     variants = [
         bot.VideoVariant("https://cdn.example/720.mp4", "1280x720", 500000),
         bot.VideoVariant("https://cdn.example/1080.mp4", "1920x1080", 2000000),
@@ -256,7 +310,44 @@ def test_pick_best_variant_prefers_highest_bitrate():
 
     best = bot.pick_best_variant(variants)
 
-    assert best.url == "https://cdn.example/1080.mp4"
+    assert best.url == "https://cdn.example/720.mp4"
+
+
+def test_pick_best_variant_uses_best_resolution_below_720p():
+    variants = [
+        bot.VideoVariant("https://cdn.example/360.mp4", "640x360", 2000000),
+        bot.VideoVariant("https://cdn.example/480.mp4", "854x480", 500000),
+    ]
+
+    assert bot.pick_best_variant(variants).url == "https://cdn.example/480.mp4"
+
+
+def test_pick_best_variant_uses_smallest_resolution_above_720p():
+    variants = [
+        bot.VideoVariant("https://cdn.example/2160.mp4", "3840x2160", 4000000),
+        bot.VideoVariant("https://cdn.example/1080.mp4", "1920x1080", 1000000),
+    ]
+
+    assert bot.pick_best_variant(variants).url == "https://cdn.example/1080.mp4"
+
+
+def test_pick_best_variant_uses_bitrate_when_resolution_is_unknown():
+    variants = [
+        bot.VideoVariant("https://cdn.example/low.mp4", None, 500000),
+        bot.VideoVariant("https://cdn.example/high.mp4", "HD", 2000000),
+    ]
+
+    assert bot.pick_best_variant(variants).url == "https://cdn.example/high.mp4"
+
+
+def test_pick_best_variant_honors_configured_height(monkeypatch):
+    monkeypatch.setattr(bot, "PREFERRED_VIDEO_HEIGHT", 480)
+    variants = [
+        bot.VideoVariant("https://cdn.example/480.mp4", "854x480", 500000),
+        bot.VideoVariant("https://cdn.example/720.mp4", "1280x720", 1000000),
+    ]
+
+    assert bot.pick_best_variant(variants).url == "https://cdn.example/480.mp4"
 
 
 def test_pick_best_variant_uses_resolution_when_bitrate_unknown():
@@ -296,6 +387,31 @@ def test_extract_redgifs_url_matches_watch_urls():
     )
 
 
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        (
+            "http://www.eporner.com/hd-porn/AbC123/example-video/",
+            "https://www.eporner.com/hd-porn/AbC123/example-video/",
+        ),
+        (
+            "https://www.eporner.com/embed/AbC123",
+            "https://www.eporner.com/embed/AbC123",
+        ),
+        (
+            "https://www.eporner.com/video-AbC123/example-video/",
+            "https://www.eporner.com/video-AbC123/example-video/",
+        ),
+    ],
+)
+def test_extract_eporner_url_matches_supported_video_urls(url, expected):
+    assert bot.extract_eporner_url(f"watch this {url}") == expected
+
+
+def test_extract_eporner_url_rejects_homepage():
+    assert bot.extract_eporner_url("https://www.eporner.com/") is None
+
+
 @pytest.mark.asyncio
 async def test_extract_message_source_url_returns_first_supported_url():
     client = MockAsyncClient(MockResponse())
@@ -308,6 +424,12 @@ async def test_extract_message_source_url_returns_first_supported_url():
         await bot.extract_message_source_url(text, client)
         == "https://www.redgifs.com/watch/decisivecelebrateduromastyxmaliensis"
     )
+
+
+def test_provider_routing_uses_dedicated_eporner_provider():
+    assert bot._providers_for_url("https://www.eporner.com/video-AbC123/example/") == [
+        bot.provider_eporner
+    ]
 
 
 @pytest.mark.asyncio
