@@ -13,4 +13,6 @@ venv/
 env/
 
 .DS_Store
-AGENTS.md
+AGENT*.md
+.env
+env
