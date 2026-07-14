@@ -20,7 +20,11 @@ xvbot/
 ├── requirements.txt        # Pinned dependencies
 ├── .env.example            # Template with all variables, no real values
 ├── test_providers.py       # Offline provider unit tests
+├── Dockerfile              # Tweezr runtime with ffprobe
+├── README.md               # Deployment and rollback guide
 ├── deploy/
+│   ├── docker-compose.yml  # Local Bot API deployment
+│   ├── telegram-bot-api.Dockerfile # Pinned official server source build
 │   ├── xvbot.service       # systemd unit file
 │   └── xvbot.logrotate     # logrotate config
 └── AGENT.md                # This file
@@ -83,7 +87,17 @@ All runtime configuration comes from environment variables loaded via `python-do
 | `DOWNLOAD_TIMEOUT_SECONDS` | no | `60` | Per-provider HTTP timeout |
 | `MAX_VIDEO_SIZE_MB` | no | `50` | Telegram cloud Bot API upload cap |
 | `PREFERRED_VIDEO_HEIGHT` | no | `720` | Preferred short-edge video resolution |
-| `EPORNER_PREFERRED_VIDEO_HEIGHT` | no | `480` | Eporner fallback when size probing fails |
+| `MIN_VIDEO_HEIGHT` | no | `720` | Shared minimum short-edge resolution |
+| `EPORNER_PREFERRED_VIDEO_HEIGHT` | no | shared preference | Optional Eporner preference override |
+| `EPORNER_MIN_VIDEO_HEIGHT` | no | shared minimum | Optional Eporner minimum override |
+| `REJECT_UNKNOWN_VIDEO_HEIGHT` | no | `true` | Reject variants with unknown dimensions |
+| `MAX_CONCURRENT_DOWNLOADS` | no | `1` | Concurrent media-processing jobs |
+| `MIN_FREE_DISK_MB` | no | `4096` | Required free-space reserve |
+| `MEDIA_TMP_DIR` | no | `/tmp` | Disk-backed temporary media directory |
+| `TELEGRAM_BOT_API_BASE_URL` | no | cloud default | Custom Bot API base URL; requires file URL |
+| `TELEGRAM_BOT_API_FILE_URL` | no | cloud default | Custom Bot API file URL; requires base URL |
+| `TELEGRAM_MEDIA_WRITE_TIMEOUT_SECONDS` | no | `300` | Multipart request write timeout |
+| `DROP_PENDING_UPDATES` | no | `false` | Whether polling discards queued updates |
 | `REQUEST_USER_AGENT` | no | `Mozilla/5.0 (compatible; XVBOT/1.0)` | Outbound UA header |
 | `LOG_LEVEL` | no | `INFO` | Python logging level |
 | `LOG_DIR` | no | `/var/log/xvbot` | Log file directory |
@@ -179,12 +193,13 @@ Never include cookies, Authorization headers, or X-specific tokens.
 
 Function: `pick_best_variant(variants: list[VideoVariant]) -> VideoVariant`
 
-Use `PREFERRED_VIDEO_HEIGHT=720` for Twitter/X and RedGifs. For Eporner, filter AV1, probe every direct MP4 with `Range: bytes=0-0`, and select the highest measured resolution at or below `MAX_VIDEO_SIZE_MB`. Use `EPORNER_PREFERRED_VIDEO_HEIGHT=480` only among unknown-size variants when all probes fail. Other sources apply this priority chain:
+Apply the shared minimum and preference to every provider. Eporner still filters AV1 and probes every direct MP4 with `Range: bytes=0-0`, but follows the same tier policy after size filtering. Provider-specific overrides are optional. Apply this priority chain:
 
 1. Exact preferred height, choosing the best bitrate when several variants match
-2. Highest available resolution below the preference
-3. Smallest available resolution above the preference
-4. Highest bitrate when dimensions are unavailable
+2. Smallest available resolution above the preference
+3. Unknown resolution only as a final fallback when strict mode is disabled
+
+Known resolutions below the configured minimum are always rejected. High bitrate is never proof of 720p.
 
 For portrait media, the shorter dimension is treated as the resolution tier, so `720x1280` is considered 720p.
 
@@ -199,9 +214,12 @@ async def download_best_video(source_url: str) -> Path | None:
 ```
 
 - Use a single `httpx.AsyncClient` shared across all provider attempts for that message.
-- Once a provider returns variants, select a suitable variant, then stream the video to `/tmp/xvbot_<uuid4_hex>.mp4`.
+- Once a provider returns variants, select a suitable variant, then stream the video to `MEDIA_TMP_DIR/xvbot_<uuid4_hex>.mp4`.
 - For Eporner, measure sizes before the full download and never select a known oversized variant.
 - Stream in 32 KB chunks — do not load the whole file into memory.
+- Enforce the upload cap from `Content-Length`, during streaming, and after download.
+- Preserve `MIN_FREE_DISK_MB` and remove every rejected partial file.
+- Run read-only `ffprobe` validation for MP4, H.264, AAC when present/expected, positive duration, and minimum resolution. Never transcode.
 - Return the `Path` on success, `None` if all providers fail.
 - The temp file must not exist in the filesystem if this function returns `None`.
 
