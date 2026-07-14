@@ -28,7 +28,7 @@ RUN apt-get update \
     && mkdir -p /var/lib/telegram-bot-api/tmp \
     && chown -R telegram-api:telegram-api /var/lib/telegram-bot-api
 
-COPY --from=build /src/build/telegram-bot-api/telegram-bot-api /usr/local/bin/telegram-bot-api
+COPY --from=build /src/build/telegram-bot-api /usr/local/bin/telegram-bot-api
 
 USER telegram-api
 WORKDIR /var/lib/telegram-bot-api
