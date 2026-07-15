@@ -1,4 +1,8 @@
 import os
+import logging
+import json
+import subprocess
+import sys
 from types import SimpleNamespace
 
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "test-token")
@@ -10,18 +14,64 @@ import pytest
 import bot
 
 
+def _import_bot_with_env(overrides):
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "TELEGRAM_BOT_TOKEN": "test-token",
+            "CHANNEL_ID": "-1001704658742",
+            "LOG_DIR": "/tmp/xvbot-config-test-logs",
+        }
+    )
+    for name, value in overrides.items():
+        if value is None:
+            environment.pop(name, None)
+        else:
+            environment[name] = value
+    return subprocess.run(
+        [sys.executable, "-c", "import bot"],
+        cwd=os.path.dirname(__file__),
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
 class MockResponse:
-    def __init__(self, json_data=None, text="", url="https://provider.test/response"):
+    def __init__(
+        self,
+        json_data=None,
+        text="",
+        url="https://provider.test/response",
+        headers=None,
+        status_code=200,
+        chunks=None,
+    ):
         self._json_data = json_data
         self.text = text
         self.url = url
+        self.headers = headers or {}
+        self.status_code = status_code
         self.history = []
+        self.chunks = chunks or []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return False
 
     def json(self):
         return self._json_data
 
     def raise_for_status(self):
         return None
+
+    async def aiter_bytes(self, chunk_size=None):
+        del chunk_size
+        for chunk in self.chunks:
+            yield chunk
 
 
 class MockAsyncClient:
@@ -51,6 +101,17 @@ class MockAsyncClient:
     async def head(self, url, **kwargs):
         self.requests.append(("HEAD", url, kwargs))
         return self._next_response()
+
+    def stream(self, method, url, **kwargs):
+        self.requests.append((method, url, kwargs))
+        return self._next_response()
+
+
+def test_cloud_size_and_strict_resolution_defaults():
+    assert bot.MAX_VIDEO_SIZE_MB == 50
+    assert bot.MIN_VIDEO_HEIGHT == 720
+    assert bot.PREFERRED_VIDEO_HEIGHT == 720
+    assert bot.REJECT_UNKNOWN_VIDEO_HEIGHT is True
 
 
 @pytest.mark.asyncio
@@ -247,7 +308,76 @@ async def test_provider_redgifs_returns_variants():
     assert client.requests[1][2]["headers"]["Authorization"] == "Bearer temp-token"
 
 
-def test_pick_best_variant_prefers_highest_bitrate():
+@pytest.mark.asyncio
+async def test_provider_eporner_returns_direct_mp4_variants(monkeypatch):
+    def fake_extract_info(self, url, download):
+        assert url == "https://www.eporner.com/video-AbC123/example-video/"
+        assert download is False
+        return {
+            "formats": [
+                {
+                    "url": "http://cdn.example/video-720.mp4",
+                    "protocol": "https",
+                    "ext": "mp4",
+                    "width": 1280,
+                    "height": 720,
+                    "tbr": 1500.5,
+                },
+                {
+                    "url": "https://cdn.example/video-1080.mp4",
+                    "protocol": "https",
+                    "ext": "mp4",
+                    "width": 1920,
+                    "height": 1080,
+                },
+                {
+                    "url": "https://cdn.example/video-480-av1.mp4",
+                    "protocol": "https",
+                    "ext": "mp4",
+                    "width": 854,
+                    "height": 480,
+                    "vcodec": "av1",
+                },
+                {
+                    "url": "https://cdn.example/video-720-av1.mp4",
+                    "protocol": "https",
+                    "ext": "mp4",
+                    "width": 1280,
+                    "height": 720,
+                },
+                {
+                    "url": "https://cdn.example/playlist.m3u8",
+                    "protocol": "m3u8_native",
+                    "ext": "mp4",
+                    "height": 720,
+                },
+            ]
+        }
+
+    monkeypatch.setattr(bot._HttpsOnlyYoutubeDL, "extract_info", fake_extract_info)
+
+    variants = await bot.provider_eporner(
+        "https://www.eporner.com/video-AbC123/example-video/",
+        MockAsyncClient(MockResponse()),
+    )
+
+    assert variants == [
+        bot.VideoVariant("https://cdn.example/video-720.mp4", "1280x720", 1500500),
+        bot.VideoVariant("https://cdn.example/video-1080.mp4", "1920x1080", None),
+    ]
+
+
+def test_eporner_extractor_upgrades_internal_requests_to_https(monkeypatch):
+    monkeypatch.setattr(bot.YoutubeDL, "urlopen", lambda self, request: request)
+    downloader = object.__new__(bot._HttpsOnlyYoutubeDL)
+    request = bot.YtDlpRequest("http://www.eporner.com/xhr/video/AbC123")
+
+    upgraded = downloader.urlopen(request)
+
+    assert upgraded.url == "https://www.eporner.com/xhr/video/AbC123"
+
+
+def test_pick_best_variant_prefers_720p_over_higher_bitrate():
     variants = [
         bot.VideoVariant("https://cdn.example/720.mp4", "1280x720", 500000),
         bot.VideoVariant("https://cdn.example/1080.mp4", "1920x1080", 2000000),
@@ -256,7 +386,140 @@ def test_pick_best_variant_prefers_highest_bitrate():
 
     best = bot.pick_best_variant(variants)
 
-    assert best.url == "https://cdn.example/1080.mp4"
+    assert best.url == "https://cdn.example/720.mp4"
+
+
+def test_pick_best_variant_rejects_resolutions_below_720p():
+    variants = [
+        bot.VideoVariant("https://cdn.example/360.mp4", "640x360", 2000000),
+        bot.VideoVariant("https://cdn.example/480.mp4", "854x480", 500000),
+    ]
+
+    assert bot.pick_best_variant(variants) is None
+
+
+def test_pick_best_variant_uses_smallest_resolution_above_720p():
+    variants = [
+        bot.VideoVariant("https://cdn.example/2160.mp4", "3840x2160", 4000000),
+        bot.VideoVariant("https://cdn.example/1080.mp4", "1920x1080", 1000000),
+    ]
+
+    assert bot.pick_best_variant(variants).url == "https://cdn.example/1080.mp4"
+
+
+def test_pick_best_variant_rejects_unknown_resolution_by_default():
+    variants = [
+        bot.VideoVariant("https://cdn.example/low.mp4", None, 500000),
+        bot.VideoVariant("https://cdn.example/high.mp4", "HD", 2000000),
+    ]
+
+    assert bot.pick_best_variant(variants) is None
+
+
+def test_pick_best_variant_can_use_unknown_resolution_as_final_fallback():
+    variants = [
+        bot.VideoVariant("https://cdn.example/low.mp4", None, 500000),
+        bot.VideoVariant("https://cdn.example/high.mp4", "HD", 2000000),
+    ]
+
+    best = bot.pick_best_variant(variants, reject_unknown_height=False)
+
+    assert best.url == "https://cdn.example/high.mp4"
+
+
+def test_pick_best_variant_honors_configured_height(monkeypatch):
+    monkeypatch.setattr(bot, "PREFERRED_VIDEO_HEIGHT", 480)
+    monkeypatch.setattr(bot, "MIN_VIDEO_HEIGHT", 480)
+    variants = [
+        bot.VideoVariant("https://cdn.example/480.mp4", "854x480", 500000),
+        bot.VideoVariant("https://cdn.example/720.mp4", "1280x720", 1000000),
+    ]
+
+    assert bot.pick_best_variant(variants).url == "https://cdn.example/480.mp4"
+
+
+def test_pick_best_variant_accepts_source_specific_height():
+    variants = [
+        bot.VideoVariant("https://cdn.example/480.mp4", "854x480", 500000),
+        bot.VideoVariant("https://cdn.example/720.mp4", "1280x720", 1000000),
+    ]
+
+    assert (
+        bot.pick_best_variant(variants, preferred_height=480, minimum_height=480).url
+        == "https://cdn.example/480.mp4"
+    )
+
+
+def test_pick_best_fitting_variant_rejects_subminimum_media_under_cap():
+    variants = [
+        bot.VideoVariant("https://cdn.example/240.mp4", "240p", None, 31_000_000),
+        bot.VideoVariant("https://cdn.example/360.mp4", "360p", None, 58_000_000),
+        bot.VideoVariant("https://cdn.example/480.mp4", "480p", None, 112_000_000),
+    ]
+
+    best = bot.pick_best_fitting_variant(
+        variants,
+        max_size_bytes=50 * 1024 * 1024,
+        preferred_height=480,
+    )
+
+    assert best is None
+
+
+def test_pick_best_fitting_variant_prefers_720p_over_larger_tiers():
+    variants = [
+        bot.VideoVariant("https://cdn.example/720-low.mp4", "1280x720", 500_000, 31_000_000),
+        bot.VideoVariant("https://cdn.example/720-high.mp4", "1280x720", 1_500_000, 45_000_000),
+        bot.VideoVariant("https://cdn.example/1080.mp4", "1920x1080", 2_000_000, 49_000_000),
+    ]
+
+    best = bot.pick_best_fitting_variant(
+        variants,
+        max_size_bytes=50 * 1024 * 1024,
+        preferred_height=720,
+        minimum_height=720,
+    )
+
+    assert best.url == "https://cdn.example/720-high.mp4"
+
+
+def test_pick_best_fitting_variant_returns_none_when_every_known_variant_is_too_large():
+    variants = [
+        bot.VideoVariant("https://cdn.example/360.mp4", "360p", None, 58_000_000),
+        bot.VideoVariant("https://cdn.example/480.mp4", "480p", None, 112_000_000),
+    ]
+
+    assert (
+        bot.pick_best_fitting_variant(
+            variants,
+            max_size_bytes=50 * 1024 * 1024,
+            preferred_height=480,
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_probe_eporner_variant_sizes_uses_one_byte_ranges():
+    variants = [
+        bot.VideoVariant("https://cdn.example/240.mp4", "240p", None),
+        bot.VideoVariant("https://cdn.example/480.mp4", "480p", None),
+    ]
+    client = MockAsyncClient(
+        [
+            MockResponse(headers={"Content-Range": "bytes 0-0/31029784"}, status_code=206),
+            MockResponse(headers={"Content-Range": "bytes 0-0/112438476"}, status_code=206),
+        ]
+    )
+
+    measured = await bot._probe_eporner_variant_sizes(
+        "https://www.eporner.com/video-AbC123/example/",
+        variants,
+        client,
+    )
+
+    assert [variant.size_bytes for variant in measured] == [31_029_784, 112_438_476]
+    assert all(request[2]["headers"]["Range"] == "bytes=0-0" for request in client.requests)
 
 
 def test_pick_best_variant_uses_resolution_when_bitrate_unknown():
@@ -268,6 +531,26 @@ def test_pick_best_variant_uses_resolution_when_bitrate_unknown():
     best = bot.pick_best_variant(variants)
 
     assert best.url == "https://cdn.example/720.mp4"
+
+
+def test_pick_best_variant_treats_portrait_short_edge_as_height():
+    variants = [
+        bot.VideoVariant("https://cdn.example/portrait.mp4", "720x1280", 900000),
+        bot.VideoVariant("https://cdn.example/landscape.mp4", "1920x1080", 1500000),
+    ]
+
+    assert bot.pick_best_variant(variants).url == "https://cdn.example/portrait.mp4"
+
+
+def test_pick_best_variant_rejects_oversized_exact_match():
+    variants = [
+        bot.VideoVariant("https://cdn.example/720.mp4", "1280x720", 900000, 101),
+        bot.VideoVariant("https://cdn.example/1080.mp4", "1920x1080", 1500000, 90),
+    ]
+
+    best = bot.pick_best_variant(variants, max_size_bytes=100)
+
+    assert best.url == "https://cdn.example/1080.mp4"
 
 
 def test_extract_tweet_url_matches_valid_urls():
@@ -296,6 +579,31 @@ def test_extract_redgifs_url_matches_watch_urls():
     )
 
 
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        (
+            "http://www.eporner.com/hd-porn/AbC123/example-video/",
+            "https://www.eporner.com/hd-porn/AbC123/example-video/",
+        ),
+        (
+            "https://www.eporner.com/embed/AbC123",
+            "https://www.eporner.com/embed/AbC123",
+        ),
+        (
+            "https://www.eporner.com/video-AbC123/example-video/",
+            "https://www.eporner.com/video-AbC123/example-video/",
+        ),
+    ],
+)
+def test_extract_eporner_url_matches_supported_video_urls(url, expected):
+    assert bot.extract_eporner_url(f"watch this {url}") == expected
+
+
+def test_extract_eporner_url_rejects_homepage():
+    assert bot.extract_eporner_url("https://www.eporner.com/") is None
+
+
 @pytest.mark.asyncio
 async def test_extract_message_source_url_returns_first_supported_url():
     client = MockAsyncClient(MockResponse())
@@ -310,8 +618,26 @@ async def test_extract_message_source_url_returns_first_supported_url():
     )
 
 
+def test_provider_routing_uses_dedicated_eporner_provider():
+    assert bot._providers_for_url("https://www.eporner.com/video-AbC123/example/") == [
+        bot.provider_eporner
+    ]
+
+
+def test_eporner_inherits_shared_720p_preference_and_minimum():
+    assert (
+        bot._preferred_height_for_url("https://www.eporner.com/video-AbC123/example/")
+        == 720
+    )
+    assert (
+        bot._minimum_height_for_url("https://www.eporner.com/video-AbC123/example/")
+        == 720
+    )
+    assert bot._preferred_height_for_url("https://x.com/example/status/123") == 720
+
+
 @pytest.mark.asyncio
-async def test_send_video_or_document_skips_send_video_when_file_exceeds_cap(tmp_path, monkeypatch):
+async def test_send_video_or_document_rejects_file_exceeding_upload_cap(tmp_path, monkeypatch):
     class MockBot:
         def __init__(self):
             self.video_calls = 0
@@ -334,6 +660,313 @@ async def test_send_video_or_document_skips_send_video_when_file_exceeds_cap(tmp
         "https://www.redgifs.com/watch/example",
     )
 
-    assert uploaded is True
+    assert uploaded is False
     assert mock_bot.video_calls == 0
-    assert mock_bot.document_calls == 1
+    assert mock_bot.document_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_send_video_does_not_retry_network_error_413(tmp_path):
+    class MockBot:
+        def __init__(self):
+            self.video_calls = 0
+            self.document_calls = 0
+
+        async def send_video(self, **kwargs):
+            self.video_calls += 1
+            raise bot.NetworkError("Request Entity Too Large (413)")
+
+        async def send_document(self, **kwargs):
+            self.document_calls += 1
+
+    video_path = tmp_path / "video.mp4"
+    video_path.write_bytes(b"video")
+    mock_bot = MockBot()
+
+    uploaded = await bot._send_video_or_document(
+        SimpleNamespace(bot=mock_bot),
+        video_path,
+        "https://www.eporner.com/video-AbC123/example/",
+    )
+
+    assert uploaded is False
+    assert mock_bot.video_calls == 1
+    assert mock_bot.document_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_download_rejects_oversized_content_length_before_writing(tmp_path, monkeypatch):
+    response = MockResponse(headers={"Content-Length": "101"}, chunks=[b"not-read"])
+    client = MockAsyncClient(response)
+    temp_path = tmp_path / "oversized.mp4"
+    variant = bot.VideoVariant("https://cdn.example/video.mp4", "1280x720", None)
+    monkeypatch.setattr(bot, "MAX_VIDEO_SIZE_BYTES", 100)
+    monkeypatch.setattr(bot, "_has_sufficient_free_disk", lambda required_bytes=0: True)
+
+    downloaded = await bot._download_variant(
+        client, variant, "https://x.com/example/status/123", temp_path
+    )
+
+    assert downloaded is False
+    assert not temp_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_download_stops_at_streaming_cap_and_removes_partial(tmp_path, monkeypatch):
+    response = MockResponse(chunks=[b"1234", b"5678"])
+    client = MockAsyncClient(response)
+    temp_path = tmp_path / "partial.mp4"
+    variant = bot.VideoVariant("https://cdn.example/video.mp4", "1280x720", None)
+    monkeypatch.setattr(bot, "MAX_VIDEO_SIZE_BYTES", 6)
+    monkeypatch.setattr(bot, "_has_sufficient_free_disk", lambda required_bytes=0: True)
+
+    downloaded = await bot._download_variant(
+        client, variant, "https://x.com/example/status/123", temp_path
+    )
+
+    assert downloaded is False
+    assert not temp_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_download_rejects_insufficient_free_disk(tmp_path, monkeypatch):
+    client = MockAsyncClient(MockResponse(chunks=[b"video"]))
+    temp_path = tmp_path / "no-space.mp4"
+    variant = bot.VideoVariant("https://cdn.example/video.mp4", "1280x720", None)
+    monkeypatch.setattr(bot, "_has_sufficient_free_disk", lambda required_bytes=0: False)
+
+    downloaded = await bot._download_variant(
+        client, variant, "https://x.com/example/status/123", temp_path
+    )
+
+    assert downloaded is False
+    assert not temp_path.exists()
+
+
+def _ffprobe_payload(video_codec="h264", audio_codec="aac", height=720, duration="3.5"):
+    return {
+        "format": {"format_name": "mov,mp4,m4a,3gp,3g2,mj2", "duration": duration},
+        "streams": [
+            {
+                "codec_type": "video",
+                "codec_name": video_codec,
+                "width": 1280,
+                "height": height,
+            },
+            {"codec_type": "audio", "codec_name": audio_codec},
+        ],
+    }
+
+
+async def _mock_ffprobe(monkeypatch, payload, returncode=0):
+    class MockProcess:
+        def __init__(self):
+            self.returncode = returncode
+
+        async def communicate(self):
+            return json.dumps(payload).encode(), b"probe failed"
+
+    async def create_subprocess_exec(*args, **kwargs):
+        assert args[0] == "ffprobe"
+        assert "ffmpeg" not in args
+        return MockProcess()
+
+    monkeypatch.setattr(bot.asyncio, "create_subprocess_exec", create_subprocess_exec)
+
+
+@pytest.mark.asyncio
+async def test_valid_h264_aac_mp4_passes_media_validation(tmp_path, monkeypatch):
+    video_path = tmp_path / "video.mp4"
+    video_path.write_bytes(b"video")
+    await _mock_ffprobe(monkeypatch, _ffprobe_payload())
+
+    assert await bot.validate_media(video_path) is True
+
+
+@pytest.mark.asyncio
+async def test_silent_media_is_allowed_when_source_does_not_expect_audio(tmp_path, monkeypatch):
+    video_path = tmp_path / "silent.mp4"
+    video_path.write_bytes(b"video")
+    payload = _ffprobe_payload()
+    payload["streams"] = payload["streams"][:1]
+    await _mock_ffprobe(monkeypatch, payload)
+
+    assert await bot.validate_media(video_path, require_audio=False) is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _ffprobe_payload(video_codec="vp9"),
+        _ffprobe_payload(audio_codec="opus"),
+        _ffprobe_payload(height=480),
+        _ffprobe_payload(duration="0"),
+        {"format": {"format_name": "mp4", "duration": "2"}, "streams": []},
+    ],
+)
+async def test_incompatible_media_fails_validation(tmp_path, monkeypatch, payload):
+    video_path = tmp_path / "video.mp4"
+    video_path.write_bytes(b"video")
+    await _mock_ffprobe(monkeypatch, payload)
+
+    assert await bot.validate_media(video_path) is False
+
+
+def test_build_application_uses_cloud_defaults_when_custom_urls_absent(monkeypatch):
+    calls = []
+
+    class Builder:
+        def token(self, value):
+            calls.append(("token", value))
+            return self
+
+        def build(self):
+            calls.append(("build",))
+            return "application"
+
+    class FakeApplication:
+        @staticmethod
+        def builder():
+            return Builder()
+
+    monkeypatch.setattr(bot, "Application", FakeApplication)
+    monkeypatch.setattr(bot, "TELEGRAM_BOT_API_BASE_URL", None)
+    monkeypatch.setattr(bot, "TELEGRAM_BOT_API_FILE_URL", None)
+
+    assert bot.build_application() == "application"
+    assert calls == [("token", bot.TOKEN), ("build",)]
+
+
+def test_incomplete_local_api_configuration_fails_without_exposing_token():
+    result = _import_bot_with_env(
+        {
+            "TELEGRAM_BOT_API_BASE_URL": "http://telegram-api:8081/bot",
+            "TELEGRAM_BOT_API_FILE_URL": None,
+        }
+    )
+
+    assert result.returncode != 0
+    assert "must be configured together" in result.stderr
+    assert "test-token" not in result.stderr
+
+
+def test_invalid_local_api_url_shape_fails_at_startup():
+    result = _import_bot_with_env(
+        {
+            "TELEGRAM_BOT_API_BASE_URL": "http://telegram-api:8081",
+            "TELEGRAM_BOT_API_FILE_URL": "http://telegram-api:8081/file/bot",
+        }
+    )
+
+    assert result.returncode != 0
+    assert "TELEGRAM_BOT_API_BASE_URL must end with /bot" in result.stderr
+
+
+def test_invalid_resolution_configuration_fails_at_startup():
+    result = _import_bot_with_env(
+        {
+            "TELEGRAM_BOT_API_BASE_URL": None,
+            "TELEGRAM_BOT_API_FILE_URL": None,
+            "PREFERRED_VIDEO_HEIGHT": "480",
+            "MIN_VIDEO_HEIGHT": "720",
+        }
+    )
+
+    assert result.returncode != 0
+    assert "PREFERRED_VIDEO_HEIGHT must be at least MIN_VIDEO_HEIGHT" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [("MAX_CONCURRENT_DOWNLOADS", "0"), ("MIN_FREE_DISK_MB", "-1")],
+)
+def test_invalid_capacity_configuration_fails_at_startup(name, value):
+    result = _import_bot_with_env(
+        {
+            "TELEGRAM_BOT_API_BASE_URL": None,
+            "TELEGRAM_BOT_API_FILE_URL": None,
+            name: value,
+        }
+    )
+
+    assert result.returncode != 0
+    assert f"{name} must be a positive integer" in result.stderr
+
+
+def test_build_application_applies_local_urls_and_media_timeout(monkeypatch):
+    calls = []
+
+    class Builder:
+        def token(self, value):
+            calls.append(("token", value))
+            return self
+
+        def base_url(self, value):
+            calls.append(("base_url", value))
+            return self
+
+        def base_file_url(self, value):
+            calls.append(("base_file_url", value))
+            return self
+
+        def media_write_timeout(self, value):
+            calls.append(("media_write_timeout", value))
+            return self
+
+        def build(self):
+            return "application"
+
+    class FakeApplication:
+        @staticmethod
+        def builder():
+            return Builder()
+
+    monkeypatch.setattr(bot, "Application", FakeApplication)
+    monkeypatch.setattr(bot, "TELEGRAM_BOT_API_BASE_URL", "http://telegram-api:8081/bot")
+    monkeypatch.setattr(bot, "TELEGRAM_BOT_API_FILE_URL", "http://telegram-api:8081/file/bot")
+    monkeypatch.setattr(bot, "TELEGRAM_MEDIA_WRITE_TIMEOUT_SECONDS", 321)
+
+    assert bot.build_application() == "application"
+    assert ("base_url", "http://telegram-api:8081/bot") in calls
+    assert ("base_file_url", "http://telegram-api:8081/file/bot") in calls
+    assert ("media_write_timeout", 321) in calls
+
+
+@pytest.mark.asyncio
+async def test_file_above_cloud_limit_reaches_upload_under_local_cap(tmp_path, monkeypatch):
+    class MockBot:
+        def __init__(self):
+            self.video_calls = 0
+
+        async def send_video(self, **kwargs):
+            self.video_calls += 1
+
+    video_path = tmp_path / "large-local.mp4"
+    video_path.write_bytes(b"x" * 51)
+    mock_bot = MockBot()
+    monkeypatch.setattr(bot, "MAX_VIDEO_SIZE_BYTES", 100)
+
+    uploaded = await bot._send_video_or_document(
+        SimpleNamespace(bot=mock_bot), video_path, "https://x.com/example/status/123"
+    )
+
+    assert uploaded is True
+    assert mock_bot.video_calls == 1
+
+
+def test_logging_redacts_telegram_token_and_suppresses_http_request_logs():
+    record = logging.LogRecord(
+        "httpx",
+        logging.INFO,
+        __file__,
+        1,
+        f"POST https://api.telegram.org/bot{bot.TOKEN}/getMe",
+        (),
+        None,
+    )
+
+    assert bot._secret_filter.filter(record) is True
+    assert bot.TOKEN not in record.getMessage()
+    assert "<redacted>" in record.getMessage()
+    assert logging.getLogger("httpx").level == logging.WARNING

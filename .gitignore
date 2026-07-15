@@ -13,9 +13,15 @@ venv/
 env/
 
 .DS_Store
+<<<<<<< HEAD
 AGENTS.md
 AGENT.md
 .codex
 .agents
 graphify*
 
+=======
+AGENT*.md
+.env
+env
+>>>>>>> f5ec831a41afdd31da4b1ab012f0941c9d54f95c
