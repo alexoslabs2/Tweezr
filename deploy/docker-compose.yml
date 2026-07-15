@@ -1,76 +1,19 @@
 services:
-  telegram-bot-api:
-    build:
-      context: ..
-      dockerfile: deploy/telegram-bot-api.Dockerfile
-      args:
-        TELEGRAM_BOT_API_REF: 0a9e5696ba149c99bedf972f040d2e28776a8a4f
-    image: tweezr-telegram-bot-api:10.1
-    restart: unless-stopped
-    environment:
-      TELEGRAM_API_ID: ${TELEGRAM_API_ID:?set TELEGRAM_API_ID in the private .env file}
-      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:?set TELEGRAM_API_HASH in the private .env file}
-    command:
-      - --local
-      - --http-port=8081
-      - --dir=/var/lib/telegram-bot-api
-      - --temp-dir=/var/lib/telegram-bot-api/tmp
-    expose:
-      - "8081"
-    volumes:
-      - telegram-bot-api-data:/var/lib/telegram-bot-api
-    healthcheck:
-      test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/127.0.0.1/8081'"]
-      interval: 10s
-      timeout: 3s
-      retries: 12
-      start_period: 20s
-    read_only: true
-    tmpfs:
-      - /tmp
-    pids_limit: 256
-    mem_limit: 2g
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-
   xvbot:
     build:
       context: ..
       dockerfile: Dockerfile
     image: xvbot:latest
     restart: unless-stopped
+    env_file:
+      - ../.env
     environment:
-      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?set TELEGRAM_BOT_TOKEN in the private .env file}
-      CHANNEL_ID: ${CHANNEL_ID:?set CHANNEL_ID in the private .env file}
       LOG_DIR: /var/log/xvbot
-      MEDIA_TMP_DIR: /var/lib/xvbot/media
-      TELEGRAM_BOT_API_BASE_URL: http://telegram-bot-api:8081/bot
-      TELEGRAM_BOT_API_FILE_URL: http://telegram-bot-api:8081/file/bot
-      TELEGRAM_MEDIA_WRITE_TIMEOUT_SECONDS: ${TELEGRAM_MEDIA_WRITE_TIMEOUT_SECONDS:-300}
-      MAX_VIDEO_SIZE_MB: ${LOCAL_MAX_VIDEO_SIZE_MB:-1900}
-      PREFERRED_VIDEO_HEIGHT: ${PREFERRED_VIDEO_HEIGHT:-720}
-      MIN_VIDEO_HEIGHT: ${MIN_VIDEO_HEIGHT:-720}
-      EPORNER_PREFERRED_VIDEO_HEIGHT: ${EPORNER_PREFERRED_VIDEO_HEIGHT:-720}
-      EPORNER_MIN_VIDEO_HEIGHT: ${EPORNER_MIN_VIDEO_HEIGHT:-720}
-      REJECT_UNKNOWN_VIDEO_HEIGHT: ${REJECT_UNKNOWN_VIDEO_HEIGHT:-true}
-      MAX_CONCURRENT_DOWNLOADS: ${MAX_CONCURRENT_DOWNLOADS:-1}
-      MIN_FREE_DISK_MB: ${MIN_FREE_DISK_MB:-4096}
-      DROP_PENDING_UPDATES: ${DROP_PENDING_UPDATES:-false}
-      DOWNLOAD_TIMEOUT_SECONDS: ${DOWNLOAD_TIMEOUT_SECONDS:-60}
-      REQUEST_USER_AGENT: ${REQUEST_USER_AGENT:-Mozilla/5.0 (compatible; XVBOT/1.0)}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      ADMIN_CHAT_ID: ${ADMIN_CHAT_ID:-}
-    depends_on:
-      telegram-bot-api:
-        condition: service_healthy
     volumes:
       - xvbot-logs:/var/log/xvbot
-      - xvbot-media:/var/lib/xvbot/media
     read_only: true
-    pids_limit: 128
-    mem_limit: 1g
+    tmpfs:
+      - /tmp
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -78,5 +21,3 @@ services:
 
 volumes:
   xvbot-logs:
-  xvbot-media:
-  telegram-bot-api-data:
