@@ -247,6 +247,44 @@ async def test_provider_redgifs_returns_variants():
     assert client.requests[1][2]["headers"]["Authorization"] == "Bearer temp-token"
 
 
+@pytest.mark.asyncio
+async def test_provider_erodown_returns_only_first_valid_video():
+    client = MockAsyncClient(
+        MockResponse(
+            json_data={
+                "success": True,
+                "media": [
+                    {"type": "image", "url": "https://cdn.example/cover.jpg"},
+                    {"type": "video", "url": "http://cdn.example/insecure.mp4"},
+                    {"type": "video", "url": "https://cdn.example/first.mp4"},
+                    {"type": "video", "url": "https://cdn.example/second.mp4"},
+                ],
+            }
+        )
+    )
+    erome_url = "https://www.erome.com/a/AbC123"
+
+    variants = await bot.provider_erodown(erome_url, client)
+
+    assert variants == [bot.VideoVariant("https://cdn.example/first.mp4", None, None)]
+    assert client.requests[0][0:2] == ("POST", "https://erodown.com/download")
+    assert client.requests[0][2]["json"] == {"url": erome_url}
+
+
+@pytest.mark.asyncio
+async def test_provider_erodown_returns_none_for_failed_response():
+    client = MockAsyncClient(
+        MockResponse(json_data={"success": False, "media": []})
+    )
+
+    variants = await bot.provider_erodown(
+        "https://www.erome.com/a/DoesNotExist",
+        client,
+    )
+
+    assert variants is None
+
+
 def test_pick_best_variant_prefers_highest_bitrate():
     variants = [
         bot.VideoVariant("https://cdn.example/720.mp4", "1280x720", 500000),
@@ -296,6 +334,18 @@ def test_extract_redgifs_url_matches_watch_urls():
     )
 
 
+def test_extract_erome_url_matches_album_urls_and_normalizes_http():
+    text = "watch this http://www.erome.com/a/AbC123"
+
+    assert bot.extract_erome_url(text) == "https://www.erome.com/a/AbC123"
+
+
+def test_erome_urls_use_only_the_erodown_provider():
+    providers = bot._providers_for_url("https://www.erome.com/a/AbC123")
+
+    assert providers == [bot.provider_erodown]
+
+
 @pytest.mark.asyncio
 async def test_extract_message_source_url_returns_first_supported_url():
     client = MockAsyncClient(MockResponse())
@@ -308,6 +358,18 @@ async def test_extract_message_source_url_returns_first_supported_url():
         await bot.extract_message_source_url(text, client)
         == "https://www.redgifs.com/watch/decisivecelebrateduromastyxmaliensis"
     )
+
+
+@pytest.mark.asyncio
+async def test_extract_message_source_url_accepts_erome_album_urls():
+    client = MockAsyncClient(MockResponse())
+
+    source_url = await bot.extract_message_source_url(
+        "album https://www.erome.com/a/AbC123",
+        client,
+    )
+
+    assert source_url == "https://www.erome.com/a/AbC123"
 
 
 @pytest.mark.asyncio
