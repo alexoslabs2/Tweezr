@@ -74,6 +74,11 @@ REDGIFS_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+EROME_URL_RE = re.compile(
+    r"https?://(?:(?:www|[a-z]{2,3})\.)?erome\.com/a/[A-Za-z0-9]+/?",
+    re.IGNORECASE,
+)
+
 
 def _https_url(url: str) -> str:
     if url.lower().startswith("http://"):
@@ -90,6 +95,13 @@ def extract_tweet_url(text: str) -> str | None:
 
 def extract_redgifs_url(text: str) -> str | None:
     match = REDGIFS_URL_RE.search(text)
+    if not match:
+        return None
+    return _https_url(match.group(0))
+
+
+def extract_erome_url(text: str) -> str | None:
+    match = EROME_URL_RE.search(text)
     if not match:
         return None
     return _https_url(match.group(0))
@@ -130,6 +142,7 @@ def extract_supported_url(text: str) -> str | None:
         for match in (
             TWITTER_URL_RE.search(text),
             REDGIFS_URL_RE.search(text),
+            EROME_URL_RE.search(text),
         )
         if match
     ]
@@ -142,12 +155,17 @@ def _is_redgifs_url(url: str) -> bool:
     return REDGIFS_URL_RE.fullmatch(url) is not None
 
 
+def _is_erome_url(url: str) -> bool:
+    return EROME_URL_RE.fullmatch(url) is not None
+
+
 async def extract_message_source_url(text: str, client: httpx.AsyncClient) -> str | None:
     matches = [
         match
         for match in (
             TWITTER_URL_RE.search(text),
             REDGIFS_URL_RE.search(text),
+            EROME_URL_RE.search(text),
             TCO_URL_RE.search(text),
         )
         if match
@@ -549,6 +567,46 @@ async def provider_getxbot(
         return None
 
 
+async def provider_erodown(
+    erome_url: str,
+    client: httpx.AsyncClient,
+) -> list[VideoVariant] | None:
+    """Return only the first valid video from an Erome album."""
+    logger = logging.getLogger("provider_erodown")
+    try:
+        response = await client.post(
+            "https://erodown.com/download",
+            json={"url": erome_url},
+            headers=_provider_headers("https://erodown.com/"),
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict) or payload.get("success") is not True:
+            return None
+
+        media = payload.get("media")
+        if not isinstance(media, list):
+            return None
+
+        for item in media:
+            if not isinstance(item, dict) or str(item.get("type", "")).lower() != "video":
+                continue
+            variant_url = _https_variant_url(item.get("url"))
+            if not variant_url:
+                continue
+            return [
+                VideoVariant(
+                    url=variant_url,
+                    quality_label=item.get("quality") or item.get("resolution"),
+                    bitrate=_optional_int(item.get("bitrate")),
+                )
+            ]
+        return None
+    except Exception as exc:
+        logger.warning("provider failed: %s", exc)
+        return None
+
+
 PROVIDERS = [
     provider_savetwt,
     provider_ssstwitter,
@@ -561,6 +619,18 @@ PROVIDERS = [
 REDGIFS_PROVIDERS = [
     provider_redgifs,
 ]
+
+EROME_PROVIDERS = [
+    provider_erodown,
+]
+
+
+def _providers_for_url(source_url: str):
+    if _is_redgifs_url(source_url):
+        return REDGIFS_PROVIDERS
+    if _is_erome_url(source_url):
+        return EROME_PROVIDERS
+    return PROVIDERS
 
 
 RESOLUTION_RE = re.compile(r"(\d{2,5})\s*[xX]\s*(\d{2,5})")
@@ -597,7 +667,7 @@ def pick_best_variant(variants: list[VideoVariant]) -> VideoVariant:
 
 async def download_best_video(source_url: str) -> Path | None:
     logger = logging.getLogger("download_best_video")
-    providers = REDGIFS_PROVIDERS if _is_redgifs_url(source_url) else PROVIDERS
+    providers = _providers_for_url(source_url)
     timeout = httpx.Timeout(DOWNLOAD_TIMEOUT_SECONDS)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
         for provider in providers:
