@@ -14,9 +14,9 @@ from uuid import uuid4
 import httpx
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import InputMediaPhoto, Update
 from telegram.error import BadRequest, NetworkError, TelegramError
-from telegram.ext import Application, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 
 load_dotenv("/etc/xvbot/.env")
@@ -39,6 +39,8 @@ LOG_DIR = Path(os.getenv("LOG_DIR", "/var/log/xvbot"))
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID") or None
 MAX_VIDEO_SIZE_BYTES = MAX_VIDEO_SIZE_MB * 1024 * 1024
 PROCESSING_SEMAPHORE = asyncio.Semaphore(3)
+_fetch_active = False
+_fetch_cancelled = False
 TMP_DIR = Path("/tmp")
 CHUNK_SIZE = 32 * 1024
 
@@ -76,6 +78,21 @@ REDGIFS_URL_RE = re.compile(
 
 EROME_URL_RE = re.compile(
     r"https?://(?:(?:www|[a-z]{2,3})\.)?erome\.com/a/[A-Za-z0-9]+/?",
+    re.IGNORECASE,
+)
+
+REDGIFS_USER_URL_RE = re.compile(
+    r"https?://(www\.)?redgifs\.com/users/([A-Za-z0-9_-]+)/?",
+    re.IGNORECASE,
+)
+
+REDDIT_URL_RE = re.compile(
+    r"https?://(www\.)?reddit\.com/(r|u|user)/([A-Za-z0-9_]+)/?",
+    re.IGNORECASE,
+)
+
+CHAN4_URL_RE = re.compile(
+    r"https?://boards\.4chan(?:nel)?\.org/([A-Za-z0-9]+)/thread/(\d+)",
     re.IGNORECASE,
 )
 
@@ -633,6 +650,31 @@ def _providers_for_url(source_url: str):
     return PROVIDERS
 
 
+def _extract_tweet_id(tweet_url: str) -> str | None:
+    match = re.search(r"/status/(\d+)", tweet_url)
+    return match.group(1) if match else None
+
+
+async def fetch_tweet_images(tweet_url: str, client: httpx.AsyncClient) -> list[str] | None:
+    logger = logging.getLogger("fetch_tweet_images")
+    tweet_id = _extract_tweet_id(tweet_url)
+    if not tweet_id:
+        return None
+    try:
+        response = await client.get(
+            f"https://api.fxtwitter.com/i/status/{tweet_id}",
+            headers={"User-Agent": USER_AGENT},
+        )
+        response.raise_for_status()
+        payload = response.json()
+        photos = payload.get("tweet", {}).get("media", {}).get("photos", [])
+        urls = [p["url"] for p in photos if isinstance(p, dict) and isinstance(p.get("url"), str)]
+        return urls or None
+    except Exception as exc:
+        logger.warning("fxtwitter failed: %s", exc)
+        return None
+
+
 RESOLUTION_RE = re.compile(r"(\d{2,5})\s*[xX]\s*(\d{2,5})")
 
 
@@ -773,6 +815,27 @@ async def _send_video_or_document(ctx: ContextTypes.DEFAULT_TYPE, video_path: Pa
             return False
 
 
+async def _send_images(ctx: ContextTypes.DEFAULT_TYPE, photo_urls: list[str], source_url: str) -> bool:
+    logger = logging.getLogger("handle_message")
+    try:
+        if len(photo_urls) == 1:
+            await ctx.bot.send_photo(
+                chat_id=CHANNEL_ID,
+                photo=photo_urls[0],
+                caption=source_url,
+            )
+        else:
+            media = [
+                InputMediaPhoto(media=url, caption=source_url if i == 0 else None)
+                for i, url in enumerate(photo_urls)
+            ]
+            await ctx.bot.send_media_group(chat_id=CHANNEL_ID, media=media)
+        return True
+    except TelegramError as exc:
+        logger.error("send_photo/media_group failed: %s", exc)
+        return False
+
+
 async def _alert_admin(ctx: ContextTypes.DEFAULT_TYPE, source_url: str) -> None:
     if not ADMIN_CHAT_ID:
         return
@@ -794,6 +857,252 @@ async def _alert_admin(ctx: ContextTypes.DEFAULT_TYPE, source_url: str) -> None:
         logger.warning("admin alert failed: %s", exc)
 
 
+async def fetch_redgifs_user_media(username: str, client: httpx.AsyncClient):
+    logger = logging.getLogger("fetch_redgifs_user")
+    try:
+        token_resp = await client.get(
+            "https://api.redgifs.com/v2/auth/temporary",
+            headers=_provider_headers("https://www.redgifs.com/"),
+        )
+        token_resp.raise_for_status()
+        token = token_resp.json().get("token")
+        if not isinstance(token, str) or not token:
+            logger.error("failed to obtain RedGifs token")
+            return
+    except Exception as exc:
+        logger.error("RedGifs auth failed: %s", exc)
+        return
+
+    cursor = None
+    while True:
+        params: dict = {"count": 40}
+        if cursor:
+            params["pos"] = cursor
+        try:
+            resp = await client.get(
+                f"https://api.redgifs.com/v2/users/{username}/search",
+                params=params,
+                headers={**_provider_headers("https://www.redgifs.com/"), "Authorization": f"Bearer {token}"},
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+        except Exception as exc:
+            logger.warning("RedGifs user page failed: %s", exc)
+            break
+
+        gifs = payload.get("gifs", [])
+        if not gifs:
+            break
+
+        for gif in gifs:
+            if not isinstance(gif, dict):
+                continue
+            urls = gif.get("urls", {})
+            video_url = _https_variant_url(urls.get("hd") or urls.get("sd"))
+            if video_url:
+                yield video_url
+
+        cursor = payload.get("cursor")
+        if not cursor:
+            break
+
+
+def _extract_reddit_post_media(post: dict) -> dict | None:
+    if post.get("is_gallery"):
+        items = post.get("gallery_data", {}).get("items", [])
+        metadata = post.get("media_metadata", {})
+        urls = []
+        for item in items:
+            mid = item.get("media_id")
+            if not mid:
+                continue
+            s = metadata.get(mid, {}).get("s", {})
+            url = s.get("u") or s.get("gif")
+            if url:
+                urls.append(url.replace("&amp;", "&"))
+        return {"type": "gallery", "urls": urls} if urls else None
+
+    if post.get("is_video"):
+        url = post.get("media", {}).get("reddit_video", {}).get("fallback_url")
+        return {"type": "video", "url": url} if url else None
+
+    url = post.get("url", "")
+    if post.get("post_hint") == "image" or re.search(r"\.(jpg|jpeg|png|gif|webp)(\?|$)", url, re.IGNORECASE):
+        if url.startswith("http"):
+            return {"type": "image", "url": url}
+
+    return None
+
+
+async def fetch_reddit_media(target_url: str, client: httpx.AsyncClient):
+    logger = logging.getLogger("fetch_reddit")
+    match = REDDIT_URL_RE.match(target_url)
+    if not match:
+        return
+    kind, name = match.group(2).lower(), match.group(3)
+    if kind in ("u", "user"):
+        api_url = f"https://www.reddit.com/user/{name}/submitted.json"
+    else:
+        api_url = f"https://www.reddit.com/r/{name}.json"
+
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+    after = None
+    while True:
+        params: dict = {"limit": 100, "raw_json": 1}
+        if after:
+            params["after"] = after
+        try:
+            resp = await client.get(api_url, params=params, headers=headers)
+            resp.raise_for_status()
+            data = resp.json().get("data", {})
+        except Exception as exc:
+            logger.warning("Reddit fetch failed: %s", exc)
+            break
+
+        children = data.get("children", [])
+        if not children:
+            break
+
+        for child in children:
+            item = _extract_reddit_post_media(child.get("data", {}))
+            if item:
+                yield item
+
+        after = data.get("after")
+        if not after:
+            break
+
+
+async def _download_to_temp(url: str, client: httpx.AsyncClient) -> Path | None:
+    temp_path = TMP_DIR / f"xvbot_{uuid4().hex}.mp4"
+    try:
+        async with client.stream("GET", url, headers={"User-Agent": USER_AGENT, "Accept": "*/*"}) as resp:
+            resp.raise_for_status()
+            with temp_path.open("wb") as f:
+                async for chunk in resp.aiter_bytes(CHUNK_SIZE):
+                    if chunk:
+                        f.write(chunk)
+        if temp_path.exists() and temp_path.stat().st_size > 0:
+            return temp_path
+    except Exception:
+        pass
+    temp_path.unlink(missing_ok=True)
+    return None
+
+
+async def fetch_4chan_thread_media(board: str, thread_id: str, client: httpx.AsyncClient):
+    logger = logging.getLogger("fetch_4chan")
+    try:
+        resp = await client.get(
+            f"https://a.4cdn.org/{board}/thread/{thread_id}.json",
+            headers={"User-Agent": USER_AGENT},
+        )
+        resp.raise_for_status()
+        posts = resp.json().get("posts", [])
+    except Exception as exc:
+        logger.error("4chan API failed: %s", exc)
+        return
+
+    image_exts = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+    video_exts = {".webm", ".mp4"}
+
+    for post in posts:
+        attachments = [post] + post.get("extra_files", [])
+        for att in attachments:
+            ext = att.get("ext", "").lower()
+            tim = att.get("tim")
+            if not tim or not ext:
+                continue
+            url = f"https://i.4cdn.org/{board}/{tim}{ext}"
+            if ext in image_exts:
+                yield {"type": "image", "url": url}
+            elif ext in video_exts:
+                yield {"type": "video", "url": url}
+
+
+async def handle_fetch_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global _fetch_active, _fetch_cancelled
+    logger = logging.getLogger("handle_fetch")
+    message = update.channel_post or update.message
+    if not message:
+        return
+
+    if _fetch_active:
+        await ctx.bot.send_message(chat_id=CHANNEL_ID, text="Fetch em andamento. Use /stop para cancelar.")
+        return
+
+    args = ctx.args or []
+    if not args:
+        await ctx.bot.send_message(
+            chat_id=CHANNEL_ID,
+            text="Uso: /fetch <url>\nSuportado: redgifs.com/users/* · boards.4chan.org/*/thread/*",
+        )
+        return
+
+    target_url = args[0].strip()
+    redgifs_match = REDGIFS_USER_URL_RE.match(target_url)
+    chan4_match = CHAN4_URL_RE.match(target_url)
+
+    if not redgifs_match and not chan4_match:
+        await ctx.bot.send_message(chat_id=CHANNEL_ID, text=f"URL não suportada: {target_url}")
+        return
+
+    _fetch_active = True
+    _fetch_cancelled = False
+    count = 0
+    timeout = httpx.Timeout(DOWNLOAD_TIMEOUT_SECONDS)
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            if redgifs_match:
+                username = redgifs_match.group(2)
+                async for video_url in fetch_redgifs_user_media(username, client):
+                    if _fetch_cancelled:
+                        break
+                    temp_path = await _download_to_temp(video_url, client)
+                    if temp_path:
+                        try:
+                            await _send_video_or_document(ctx, temp_path, video_url)
+                            count += 1
+                        finally:
+                            temp_path.unlink(missing_ok=True)
+                    await asyncio.sleep(1)
+
+            elif chan4_match:
+                board, thread_id = chan4_match.group(1), chan4_match.group(2)
+                async for item in fetch_4chan_thread_media(board, thread_id, client):
+                    if _fetch_cancelled:
+                        break
+                    try:
+                        if item["type"] == "image":
+                            await ctx.bot.send_photo(chat_id=CHANNEL_ID, photo=item["url"])
+                            count += 1
+                        elif item["type"] == "video":
+                            temp_path = await _download_to_temp(item["url"], client)
+                            if temp_path:
+                                try:
+                                    await _send_video_or_document(ctx, temp_path, item["url"])
+                                    count += 1
+                                finally:
+                                    temp_path.unlink(missing_ok=True)
+                    except TelegramError as exc:
+                        logger.warning("send failed: %s", exc)
+                    await asyncio.sleep(0.5)
+    finally:
+        _fetch_active = False
+
+    status = "Cancelado" if _fetch_cancelled else "Concluído"
+    await ctx.bot.send_message(chat_id=CHANNEL_ID, text=f"{status}. {count} itens enviados de {target_url}")
+
+
+async def handle_stop_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global _fetch_cancelled
+    if _fetch_active:
+        _fetch_cancelled = True
+        await ctx.bot.send_message(chat_id=CHANNEL_ID, text="Parando após o item atual...")
+    else:
+        await ctx.bot.send_message(chat_id=CHANNEL_ID, text="Nenhum fetch em andamento.")
+
+
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     logger = logging.getLogger("handle_message")
     async with PROCESSING_SEMAPHORE:
@@ -810,6 +1119,20 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
             temp_path = await download_best_video(source_url)
             if temp_path is None:
+                if TWITTER_URL_RE.fullmatch(source_url):
+                    async with httpx.AsyncClient(timeout=httpx.Timeout(DOWNLOAD_TIMEOUT_SECONDS)) as client:
+                        photo_urls = await fetch_tweet_images(source_url, client)
+                    if photo_urls:
+                        uploaded = await _send_images(ctx, photo_urls, source_url)
+                        if uploaded:
+                            try:
+                                await ctx.bot.delete_message(
+                                    chat_id=CHANNEL_ID,
+                                    message_id=message.message_id,
+                                )
+                            except TelegramError as exc:
+                                logger.warning("delete_message failed: %s", exc)
+                        return
                 logger.error("all providers failed for URL")
                 await _alert_admin(ctx, source_url)
                 return
@@ -835,6 +1158,8 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 def main():
     LOGGER.info("starting xvbot")
     app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("fetch", handle_fetch_command, filters=filters.Chat(CHANNEL_ID)))
+    app.add_handler(CommandHandler("stop", handle_stop_command, filters=filters.Chat(CHANNEL_ID)))
     app.add_handler(MessageHandler(filters.Chat(CHANNEL_ID), handle_message))
     app.run_polling(drop_pending_updates=True)
 
