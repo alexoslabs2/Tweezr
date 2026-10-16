@@ -8,7 +8,7 @@ import re
 from collections import namedtuple
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote, urljoin, urlparse
 from uuid import uuid4
 
 import httpx
@@ -37,7 +37,9 @@ USER_AGENT = os.getenv("REQUEST_USER_AGENT", "Mozilla/5.0 (compatible; XVBOT/1.0
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 LOG_DIR = Path(os.getenv("LOG_DIR", "/var/log/xvbot"))
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID") or None
-MAX_VIDEO_SIZE_BYTES = MAX_VIDEO_SIZE_MB * 1024 * 1024
+MAX_VIDEO_SIZE_BYTES = min(MAX_VIDEO_SIZE_MB * 1024 * 1024, 50_000_000)
+if MAX_VIDEO_SIZE_BYTES <= 0:
+    raise ValueError("MAX_VIDEO_SIZE_MB must be positive")
 PROCESSING_SEMAPHORE = asyncio.Semaphore(3)
 _fetch_active = False
 _fetch_cancelled = False
@@ -45,8 +47,28 @@ TMP_DIR = Path("/tmp")
 CHUNK_SIZE = 32 * 1024
 
 
+class SecretRedactingFormatter(logging.Formatter):
+    """Redact after formatting, including exception tracebacks and HTTP debug logs."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        rendered = super().format(record)
+        for secret in (
+            TOKEN,
+            quote(TOKEN, safe=""),
+            quote(quote(TOKEN, safe=""), safe=""),
+        ):
+            rendered = rendered.replace(secret, "[REDACTED]")
+        return re.sub(
+            r"\b(?:bot)?\d{5,}(?::|%3[aA]|%253[aA])[A-Za-z0-9_-]+",
+            "[REDACTED]",
+            rendered,
+        )
+
+
 LOG_DIR.mkdir(parents=True, exist_ok=True)
-_formatter = logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
+_formatter = SecretRedactingFormatter(
+    "%(asctime)s %(levelname)s [%(name)s] %(message)s"
+)
 _file_handler = RotatingFileHandler(
     LOG_DIR / "bot.log",
     maxBytes=10 * 1024 * 1024,
@@ -60,6 +82,8 @@ _root_logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 _root_logger.handlers.clear()
 _root_logger.addHandler(_file_handler)
 _root_logger.addHandler(_stream_handler)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("main")
 
 
@@ -176,7 +200,9 @@ def _is_erome_url(url: str) -> bool:
     return EROME_URL_RE.fullmatch(url) is not None
 
 
-async def extract_message_source_url(text: str, client: httpx.AsyncClient) -> str | None:
+async def extract_message_source_url(
+    text: str, client: httpx.AsyncClient
+) -> str | None:
     matches = [
         match
         for match in (
@@ -295,7 +321,9 @@ async def provider_redgifs(
             variants.append(
                 VideoVariant(
                     url=variant_url,
-                    quality_label=quality_label if key in ("hd", "file", "file_url") else None,
+                    quality_label=quality_label
+                    if key in ("hd", "file", "file_url")
+                    else None,
                     bitrate=None,
                 )
             )
@@ -305,35 +333,126 @@ async def provider_redgifs(
         return None
 
 
+class ProviderFailure(ValueError):
+    """A provider response does not meet its extraction contract."""
+
+
+def _provider_failure(logger: logging.Logger, exc: Exception) -> None:
+    if isinstance(exc, httpx.HTTPStatusError):
+        response = exc.response
+        category = (
+            "session_rejected"
+            if response.status_code in (401, 403, 419)
+            else "http_error"
+        )
+        logger.warning(
+            "provider failed reason=%s status=%s", category, response.status_code
+        )
+    elif isinstance(exc, httpx.TimeoutException):
+        logger.warning("provider failed reason=timeout")
+    elif isinstance(exc, ProviderFailure):
+        logger.warning("provider failed reason=%s", exc)
+    else:
+        logger.warning("provider failed reason=%s", type(exc).__name__)
+
+
+def _json_payload(response: httpx.Response) -> dict:
+    response.raise_for_status()
+    if "json" not in response.headers.get("content-type", "").lower():
+        raise ProviderFailure("unexpected_format: expected JSON")
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise ProviderFailure("unexpected_format: invalid JSON") from exc
+    if not isinstance(payload, dict):
+        raise ProviderFailure("unexpected_format: expected JSON object")
+    return payload
+
+
+def _same_origin_url(base: str, target: str) -> str:
+    resolved = urljoin(base, target)
+    a, b = urlparse(base), urlparse(resolved)
+    if b.scheme != "https" or a.netloc != b.netloc:
+        raise ProviderFailure("unexpected_format: foreign form or redirect")
+    return resolved
+
+
+async def _provider_form(client, home: str, field: str):
+    response = await client.get(home, headers=_provider_headers(home))
+    response.raise_for_status()
+    soup = BeautifulSoup(response.text, "lxml")
+    input_tag = soup.find("input", attrs={"name": field})
+    form = input_tag.find_parent("form") if input_tag else None
+    if form is None:
+        raise ProviderFailure("unexpected_format: missing form")
+    data = {item["name"]: item.get("value", "") for item in form.select("input[name]")}
+    action = _same_origin_url(home, form.get("action") or home)
+    return form, data, action
+
+
+def _html_variants(html: str, selector: str, base: str) -> list[VideoVariant]:
+    soup = BeautifulSoup(html, "lxml")
+    variants = []
+    seen = set()
+    for link in soup.select(selector):
+        raw = link.get("href") or link.get("src")
+        if not isinstance(raw, str) or raw.startswith(("#", "javascript:")):
+            continue
+        url = _https_variant_url(urljoin(base, raw))
+        if not url or url in seen or urlparse(url).path in ("", "/"):
+            continue
+        row = link.find_parent("tr") or link.find_parent(class_="download__item")
+        label = row.get_text(" ", strip=True) if row else link.get_text(" ", strip=True)
+        if "mp3" in label.lower() and "mp4" not in label.lower():
+            continue
+        seen.add(url)
+        variants.append(VideoVariant(url, label or None, None))
+    return variants
+
+
+def _require_variants(variants: list[VideoVariant]) -> list[VideoVariant]:
+    if not variants:
+        raise ProviderFailure("no_variants")
+    return variants
+
+
 async def provider_savetwt(
     tweet_url: str,
     client: httpx.AsyncClient,
 ) -> list[VideoVariant] | None:
     logger = logging.getLogger("provider_savetwt")
     try:
+        home = "https://savetwt.com/"
+        _, data, action = await _provider_form(client, home, "url")
+        if not data.get("_token"):
+            raise ProviderFailure("unexpected_format: missing CSRF token")
+        data["url"] = tweet_url
         response = await client.post(
-            "https://savetwt.com/download",
-            data={"url": tweet_url},
-            headers=_provider_headers("https://savetwt.com/"),
+            action,
+            data=data,
+            headers={
+                **_provider_headers(home),
+                "Accept": "application/json",
+                "X-Requested-With": "XMLHttpRequest",
+            },
         )
-        response.raise_for_status()
-        payload = response.json()
-        links = payload.get("links", [])
-        variants = []
-        for item in links:
-            variant_url = _https_variant_url(item.get("url"))
-            if not variant_url:
-                continue
-            variants.append(
-                VideoVariant(
-                    url=variant_url,
-                    quality_label=item.get("quality"),
-                    bitrate=None,
-                )
+        payload = _json_payload(response)
+        redirect = payload.get("redirect")
+        if not isinstance(redirect, str):
+            raise ProviderFailure("unexpected_format: missing result redirect")
+        result = await client.get(
+            _same_origin_url(home, redirect), headers=_provider_headers(home)
+        )
+        result.raise_for_status()
+        return _require_variants(
+            _html_variants(
+                result.text,
+                'a.result__download__button[href], a[href*=".mp4"], video[src], video source[src]',
+                home,
             )
-        return variants or None
+        )
     except Exception as exc:
-        logger.warning("provider failed: %s", exc)
+        _provider_failure(logger, exc)
         return None
 
 
@@ -343,25 +462,29 @@ async def provider_ssstwitter(
 ) -> list[VideoVariant] | None:
     logger = logging.getLogger("provider_ssstwitter")
     try:
+        home = "https://ssstwitter.com/"
+        form, data, action = await _provider_form(client, home, "id")
+        values = form.get("include-vals", "")
+        for key, quoted, numeric in re.findall(r"(\w+):\s*(?:'([^']*)'|(\d+))", values):
+            data[key] = quoted or numeric
+        if not data.get("tt") or not data.get("ts"):
+            raise ProviderFailure("unexpected_format: missing form token")
+        data["id"] = tweet_url
         response = await client.post(
-            "https://ssstwitter.com/",
-            data={"id": tweet_url},
-            headers=_provider_headers("https://ssstwitter.com/"),
+            action,
+            data=data,
+            headers={**_provider_headers(home), "HX-Request": "true"},
         )
         response.raise_for_status()
-        soup = BeautifulSoup(response.text, "lxml")
-        variants = []
-        for link in soup.find_all("a"):
-            href = _https_variant_url(link.get("href"))
-            if not href:
-                continue
-            if not urlparse(href).path.lower().endswith(".mp4"):
-                continue
-            quality_label = link.get_text(" ", strip=True) or None
-            variants.append(VideoVariant(url=href, quality_label=quality_label, bitrate=None))
-        return variants or None
+        return _require_variants(
+            _html_variants(
+                response.text,
+                'a.download_link[href], a.download-btn[href], a[href*=".mp4"]',
+                home,
+            )
+        )
     except Exception as exc:
-        logger.warning("provider failed: %s", exc)
+        _provider_failure(logger, exc)
         return None
 
 
@@ -371,30 +494,24 @@ async def provider_tweeload(
 ) -> list[VideoVariant] | None:
     logger = logging.getLogger("provider_tweeload")
     try:
+        home = "https://tweeload.com/"
+        _, data, action = await _provider_form(client, home, "url")
+        data["url"] = tweet_url
         response = await client.post(
-            "https://tweeload.com/en/download",
-            json={"url": tweet_url},
-            headers=_provider_headers("https://tweeload.com/"),
+            action,
+            data=data,
+            headers=_provider_headers(home),
         )
         response.raise_for_status()
-        payload = response.json()
-        links = payload.get("data", {}).get("links", [])
-        variants = []
-        for item in links:
-            variant_url = _https_variant_url(item.get("url"))
-            if not variant_url:
-                continue
-            bitrate = item.get("bitrate")
-            variants.append(
-                VideoVariant(
-                    url=variant_url,
-                    quality_label=None,
-                    bitrate=bitrate if isinstance(bitrate, int) else None,
-                )
+        return _require_variants(
+            _html_variants(
+                response.text,
+                "a.download__item__info__actions__button[href]:not(.premium__locked__btn)",
+                home,
             )
-        return variants or None
+        )
     except Exception as exc:
-        logger.warning("provider failed: %s", exc)
+        _provider_failure(logger, exc)
         return None
 
 
@@ -404,32 +521,20 @@ async def provider_twittervideodownloader(
 ) -> list[VideoVariant] | None:
     logger = logging.getLogger("provider_twittervideodownloader")
     try:
+        home = "https://twittervideodownloader.com/en/"
+        _, data, action = await _provider_form(client, home, "tweet")
+        if not data.get("csrfmiddlewaretoken"):
+            raise ProviderFailure("unexpected_format: missing CSRF token")
+        data["tweet"] = tweet_url
         response = await client.post(
-            "https://twittervideodownloader.com/en/",
-            data={"tweet": tweet_url},
-            headers=_provider_headers("https://twittervideodownloader.com/en/"),
+            action,
+            data=data,
+            headers=_provider_headers(home),
         )
         response.raise_for_status()
-        payload = response.json()
-        if not isinstance(payload, list):
-            return None
-        variants = []
-        for item in payload:
-            if not isinstance(item, dict):
-                continue
-            variant_url = _https_variant_url(item.get("url"))
-            if not variant_url:
-                continue
-            variants.append(
-                VideoVariant(
-                    url=variant_url,
-                    quality_label=item.get("resolution"),
-                    bitrate=None,
-                )
-            )
-        return variants or None
+        return _require_variants(_html_variants(response.text, 'a[href*=".mp4"]', home))
     except Exception as exc:
-        logger.warning("provider failed: %s", exc)
+        _provider_failure(logger, exc)
         return None
 
 
@@ -506,7 +611,9 @@ def _parse_twmate_html_variants(html: str) -> list[VideoVariant]:
         row = link.find_parent("tr")
         cells = row.find_all("td") if row else []
         quality_label = cells[0].get_text(" ", strip=True) if cells else None
-        media_type = cells[1].get_text(" ", strip=True).lower() if len(cells) > 1 else ""
+        media_type = (
+            cells[1].get_text(" ", strip=True).lower() if len(cells) > 1 else ""
+        )
         if media_type and "mp4" not in media_type:
             continue
         variants.append(
@@ -527,7 +634,7 @@ async def provider_twmate(
     try:
         response = await client.post(
             "https://twmate.com/en2/",
-            data={"page": tweet_url, "ftype": "all"},
+            data={"page": tweet_url, "ftype": "all", "ajax": "1"},
             headers=_provider_headers("https://twmate.com/en2/"),
         )
         response.raise_for_status()
@@ -544,9 +651,12 @@ async def provider_twmate(
                     bitrate=_optional_int(item.get("bitrate")),
                 )
             )
-        return variants or _parse_twmate_html_variants(response.text) or None
+        variants = variants or _parse_twmate_html_variants(response.text)
+        if not variants and "not able to detect any video" in response.text.lower():
+            raise ProviderFailure("remote_no_video")
+        return _require_variants(variants)
     except Exception as exc:
-        logger.warning("provider failed: %s", exc)
+        _provider_failure(logger, exc)
         return None
 
 
@@ -557,16 +667,26 @@ async def provider_getxbot(
     logger = logging.getLogger("provider_getxbot")
     try:
         response = await client.post(
-            "https://www.getxbot.com/",
-            json={"url": tweet_url},
+            "https://www.getxbot.com/api/parse",
+            json={"videoId": tweet_url, "p": 1},
             headers=_provider_headers("https://www.getxbot.com/"),
         )
-        response.raise_for_status()
-        payload = response.json()
-        videos = payload.get("result", {}).get("videos", [])
+        payload = _json_payload(response)
+        if payload.get("code") != 0:
+            raise ProviderFailure("remote_error")
+        groups = payload.get("data")
+        if not isinstance(groups, dict):
+            raise ProviderFailure("unexpected_format: missing video groups")
+        # Keep one video per source post, consistently with the other adapters.
+        videos = next(
+            (items for items in groups.values() if isinstance(items, list) and items),
+            [],
+        )
         variants = []
         for item in videos:
             if not isinstance(item, dict):
+                continue
+            if item.get("content_type") != "video/mp4":
                 continue
             variant_url = _https_variant_url(item.get("url"))
             if not variant_url:
@@ -574,13 +694,13 @@ async def provider_getxbot(
             variants.append(
                 VideoVariant(
                     url=variant_url,
-                    quality_label=item.get("quality") or item.get("resolution"),
+                    quality_label=item.get("size"),
                     bitrate=_optional_int(item.get("bitrate")),
                 )
             )
-        return variants or None
+        return _require_variants(variants)
     except Exception as exc:
-        logger.warning("provider failed: %s", exc)
+        _provider_failure(logger, exc)
         return None
 
 
@@ -606,7 +726,10 @@ async def provider_erodown(
             return None
 
         for item in media:
-            if not isinstance(item, dict) or str(item.get("type", "")).lower() != "video":
+            if (
+                not isinstance(item, dict)
+                or str(item.get("type", "")).lower() != "video"
+            ):
                 continue
             variant_url = _https_variant_url(item.get("url"))
             if not variant_url:
@@ -625,12 +748,12 @@ async def provider_erodown(
 
 
 PROVIDERS = [
-    provider_savetwt,
-    provider_ssstwitter,
-    provider_tweeload,
     provider_twittervideodownloader,
-    provider_twmate,
     provider_getxbot,
+    provider_ssstwitter,
+    provider_savetwt,
+    provider_tweeload,
+    provider_twmate,
 ]
 
 REDGIFS_PROVIDERS = [
@@ -650,32 +773,7 @@ def _providers_for_url(source_url: str):
     return PROVIDERS
 
 
-def _extract_tweet_id(tweet_url: str) -> str | None:
-    match = re.search(r"/status/(\d+)", tweet_url)
-    return match.group(1) if match else None
-
-
-async def fetch_tweet_images(tweet_url: str, client: httpx.AsyncClient) -> list[str] | None:
-    logger = logging.getLogger("fetch_tweet_images")
-    tweet_id = _extract_tweet_id(tweet_url)
-    if not tweet_id:
-        return None
-    try:
-        response = await client.get(
-            f"https://api.fxtwitter.com/i/status/{tweet_id}",
-            headers={"User-Agent": USER_AGENT},
-        )
-        response.raise_for_status()
-        payload = response.json()
-        photos = payload.get("tweet", {}).get("media", {}).get("photos", [])
-        urls = [p["url"] for p in photos if isinstance(p, dict) and isinstance(p.get("url"), str)]
-        return urls or None
-    except Exception as exc:
-        logger.warning("fxtwitter failed: %s", exc)
-        return None
-
-
-RESOLUTION_RE = re.compile(r"(\d{2,5})\s*[xX]\s*(\d{2,5})")
+RESOLUTION_RE = re.compile(r"(\d{2,5})\s*[xX×]\s*(\d{2,5})")
 
 
 def _resolution_pixels(quality_label: str | None) -> int | None:
@@ -717,42 +815,97 @@ async def download_best_video(source_url: str) -> Path | None:
             try:
                 variants = await provider(source_url, client)
             except Exception as exc:
-                logging.getLogger(provider_name).warning("provider raised: %s", exc)
+                _provider_failure(logging.getLogger(provider_name), exc)
                 variants = None
 
             if not variants:
+                logger.info("provider=%s outcome=no_variants", provider_name)
                 continue
 
-            best = pick_best_variant(variants)
-            if not best.url.lower().startswith("https://"):
-                logger.warning("skipping non-HTTPS video URL from %s", provider_name)
-                continue
-
-            temp_path = TMP_DIR / f"xvbot_{uuid4().hex}.mp4"
-            try:
-                async with client.stream(
-                    "GET",
-                    best.url,
-                    headers={
-                        "User-Agent": USER_AGENT,
-                        "Referer": source_url,
-                        "Accept": "*/*",
-                    },
-                ) as response:
-                    response.raise_for_status()
-                    with temp_path.open("wb") as output:
-                        async for chunk in response.aiter_bytes(chunk_size=CHUNK_SIZE):
-                            if chunk:
-                                output.write(chunk)
-                if temp_path.exists() and temp_path.stat().st_size > 0:
-                    return temp_path
-                temp_path.unlink(missing_ok=True)
-            except Exception as exc:
-                logger.warning("download failed after %s returned variants: %s", provider_name, exc)
-                temp_path.unlink(missing_ok=True)
-                continue
+            pending = list(variants)
+            seen = set()
+            while pending:
+                best = pick_best_variant(pending)
+                pending.remove(best)
+                if best.url in seen:
+                    continue
+                seen.add(best.url)
+                try:
+                    path = await _download_variant(client, best, source_url)
+                except Exception as exc:
+                    _provider_failure(logging.getLogger(provider_name), exc)
+                    continue
+                logger.info(
+                    "provider=%s outcome=downloaded bytes=%s quality=%s",
+                    provider_name,
+                    path.stat().st_size,
+                    best.quality_label,
+                )
+                return path
 
     return None
+
+
+async def _download_variant(client, variant: VideoVariant, source_url: str) -> Path:
+    if not _https_variant_url(variant.url):
+        raise ProviderFailure("invalid_media_url")
+    temp_path = TMP_DIR / f"xvbot_{uuid4().hex}.mp4"
+    complete = False
+    try:
+        async with client.stream(
+            "GET",
+            variant.url,
+            headers={
+                "User-Agent": USER_AGENT,
+                "Referer": source_url,
+                "Accept": "video/mp4, application/octet-stream",
+            },
+        ) as response:
+            response.raise_for_status()
+            if response.url.scheme != "https":
+                raise ProviderFailure("invalid_media_redirect")
+            media_type = (
+                response.headers.get("content-type", "")
+                .split(";", 1)[0]
+                .strip()
+                .lower()
+            )
+            if media_type not in (
+                "video/mp4",
+                "application/octet-stream",
+                "binary/octet-stream",
+                "",
+            ):
+                raise ProviderFailure("invalid_media_type")
+            declared = response.headers.get("content-length", "")
+            expected = int(declared) if declared.isdigit() else None
+            if expected is not None and expected > MAX_VIDEO_SIZE_BYTES:
+                raise ProviderFailure("media_too_large")
+            size = 0
+            prefix = bytearray()
+            with temp_path.open("xb") as output:
+                async for chunk in response.aiter_bytes(chunk_size=CHUNK_SIZE):
+                    size += len(chunk)
+                    if size > MAX_VIDEO_SIZE_BYTES:
+                        raise ProviderFailure("media_too_large")
+                    if len(prefix) < 12:
+                        prefix.extend(chunk[: 12 - len(prefix)])
+                        if len(prefix) >= 12 and prefix[4:8] != b"ftyp":
+                            raise ProviderFailure("invalid_mp4_signature")
+                    output.write(chunk)
+            if size < 12 or prefix[4:8] != b"ftyp":
+                raise ProviderFailure("invalid_mp4_signature")
+            if (
+                expected is not None
+                and not response.headers.get("content-encoding")
+                and size != expected
+            ):
+                raise ProviderFailure("incomplete_media")
+        complete = True
+        return temp_path
+    finally:
+        if not complete:
+            temp_path.unlink(missing_ok=True)
 
 
 def _file_too_large_error(exc: TelegramError) -> bool:
@@ -760,21 +913,13 @@ def _file_too_large_error(exc: TelegramError) -> bool:
     return "file is too big" in message or "request entity too large" in message
 
 
-async def _send_video_or_document(ctx: ContextTypes.DEFAULT_TYPE, video_path: Path, source_url: str) -> bool:
+async def _send_video_or_document(
+    ctx: ContextTypes.DEFAULT_TYPE, video_path: Path, source_url: str
+) -> bool:
     logger = logging.getLogger("handle_message")
     if video_path.stat().st_size > MAX_VIDEO_SIZE_BYTES:
-        logger.info("video exceeds send_video size cap; sending as document")
-        with video_path.open("rb") as document:
-            try:
-                await ctx.bot.send_document(
-                    chat_id=CHANNEL_ID,
-                    document=document,
-                    caption=source_url,
-                )
-                return True
-            except TelegramError as exc:
-                logger.error("send_document failed: %s", exc)
-                return False
+        logger.error("upload refused reason=media_too_large")
+        return False
 
     with video_path.open("rb") as video:
         for attempt, delay in enumerate([1, 4, 16, None], start=1):
@@ -788,6 +933,12 @@ async def _send_video_or_document(ctx: ContextTypes.DEFAULT_TYPE, video_path: Pa
                 return True
             except BadRequest as exc:
                 if _file_too_large_error(exc):
+                    logger.error("upload refused reason=telegram_size_limit")
+                    return False
+                if "video" in str(exc).lower() and any(
+                    word in str(exc).lower()
+                    for word in ("invalid", "unsupported", "wrong")
+                ):
                     break
                 logger.error("send_video failed: %s", exc)
                 return False
@@ -795,7 +946,9 @@ async def _send_video_or_document(ctx: ContextTypes.DEFAULT_TYPE, video_path: Pa
                 if delay is None:
                     logger.error("send_video failed after retries: %s", exc)
                     return False
-                logger.warning("send_video network error on attempt %s: %s", attempt, exc)
+                logger.warning(
+                    "send_video network error on attempt %s: %s", attempt, exc
+                )
                 video.seek(0)
                 await asyncio.sleep(delay)
             except TelegramError as exc:
@@ -846,7 +999,9 @@ async def _alert_admin(ctx: ContextTypes.DEFAULT_TYPE, source_url: str) -> None:
         logger.warning("ADMIN_CHAT_ID is not an integer; skipping admin alert")
         return
     if admin_chat_id == CHANNEL_ID:
-        logger.warning("ADMIN_CHAT_ID matches CHANNEL_ID; skipping plain-text admin alert")
+        logger.warning(
+            "ADMIN_CHAT_ID matches CHANNEL_ID; skipping plain-text admin alert"
+        )
         return
     try:
         await ctx.bot.send_message(
@@ -1112,7 +1267,9 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if not message or not message.text:
                 return
 
-            async with httpx.AsyncClient(timeout=httpx.Timeout(DOWNLOAD_TIMEOUT_SECONDS)) as client:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(DOWNLOAD_TIMEOUT_SECONDS)
+            ) as client:
                 source_url = await extract_message_source_url(message.text, client)
             if not source_url:
                 return
