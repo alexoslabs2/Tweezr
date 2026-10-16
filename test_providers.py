@@ -54,100 +54,6 @@ class MockAsyncClient:
 
 
 @pytest.mark.asyncio
-async def test_provider_savetwt_returns_variants():
-    client = MockAsyncClient(
-        MockResponse(
-            json_data={
-                "links": [
-                    {"url": "https://cdn.example/video-720.mp4", "quality": "1280x720"},
-                    {"url": "https://cdn.example/video-360.mp4", "quality": "640x360"},
-                ]
-            }
-        )
-    )
-
-    variants = await bot.provider_savetwt(
-        "https://x.com/example/status/123",
-        client,
-    )
-
-    assert variants
-    assert variants[0] == bot.VideoVariant("https://cdn.example/video-720.mp4", "1280x720", None)
-    assert client.requests[0][2]["data"] == {"url": "https://x.com/example/status/123"}
-
-
-@pytest.mark.asyncio
-async def test_provider_ssstwitter_returns_variants():
-    client = MockAsyncClient(
-        MockResponse(
-            text="""
-            <html>
-              <body>
-                <a href="https://cdn.example/video-480.mp4">854x480</a>
-                <a href="https://cdn.example/not-video.jpg">image</a>
-              </body>
-            </html>
-            """
-        )
-    )
-
-    variants = await bot.provider_ssstwitter(
-        "https://twitter.com/example/status/123",
-        client,
-    )
-
-    assert variants
-    assert variants[0] == bot.VideoVariant("https://cdn.example/video-480.mp4", "854x480", None)
-    assert client.requests[0][2]["data"] == {"id": "https://twitter.com/example/status/123"}
-
-
-@pytest.mark.asyncio
-async def test_provider_tweeload_returns_variants():
-    client = MockAsyncClient(
-        MockResponse(
-            json_data={
-                "data": {
-                    "links": [
-                        {"url": "https://cdn.example/video-low.mp4", "bitrate": 320000},
-                        {"url": "https://cdn.example/video-high.mp4", "bitrate": 1200000},
-                    ]
-                }
-            }
-        )
-    )
-
-    variants = await bot.provider_tweeload(
-        "https://x.com/example/status/123",
-        client,
-    )
-
-    assert variants
-    assert variants[1] == bot.VideoVariant("https://cdn.example/video-high.mp4", None, 1200000)
-    assert client.requests[0][2]["json"] == {"url": "https://x.com/example/status/123"}
-
-
-@pytest.mark.asyncio
-async def test_provider_twittervideodownloader_returns_variants():
-    client = MockAsyncClient(
-        MockResponse(
-            json_data=[
-                {"url": "https://cdn.example/video-720.mp4", "resolution": "1280x720"},
-                {"url": "https://cdn.example/video-360.mp4", "resolution": "640x360"},
-            ]
-        )
-    )
-
-    variants = await bot.provider_twittervideodownloader(
-        "https://x.com/example/status/123",
-        client,
-    )
-
-    assert variants
-    assert variants[0] == bot.VideoVariant("https://cdn.example/video-720.mp4", "1280x720", None)
-    assert client.requests[0][2]["data"] == {"tweet": "https://x.com/example/status/123"}
-
-
-@pytest.mark.asyncio
 async def test_provider_twmate_returns_variants():
     client = MockAsyncClient(
         MockResponse(
@@ -176,36 +82,14 @@ async def test_provider_twmate_returns_variants():
     )
 
     assert variants
-    assert variants[0] == bot.VideoVariant("https://cdn.example/video-1170.mp4", "1548x1170", None)
+    assert variants[0] == bot.VideoVariant(
+        "https://cdn.example/video-1170.mp4", "1548x1170", None
+    )
     assert client.requests[0][2]["data"] == {
         "page": "https://twitter.com/example/status/123",
         "ftype": "all",
+        "ajax": "1",
     }
-
-
-@pytest.mark.asyncio
-async def test_provider_getxbot_returns_variants():
-    client = MockAsyncClient(
-        MockResponse(
-            json_data={
-                "result": {
-                    "videos": [
-                        {"url": "https://cdn.example/video-low.mp4", "bitrate": 256000},
-                        {"url": "https://cdn.example/video-high.mp4", "bitrate": "1500000"},
-                    ]
-                }
-            }
-        )
-    )
-
-    variants = await bot.provider_getxbot(
-        "https://x.com/example/status/123",
-        client,
-    )
-
-    assert variants
-    assert variants[1] == bot.VideoVariant("https://cdn.example/video-high.mp4", None, 1500000)
-    assert client.requests[0][2]["json"] == {"url": "https://x.com/example/status/123"}
 
 
 @pytest.mark.asyncio
@@ -239,7 +123,10 @@ async def test_provider_redgifs_returns_variants():
         "1920x1080",
         None,
     )
-    assert client.requests[0][0:2] == ("GET", "https://api.redgifs.com/v2/auth/temporary")
+    assert client.requests[0][0:2] == (
+        "GET",
+        "https://api.redgifs.com/v2/auth/temporary",
+    )
     assert client.requests[1][0:2] == (
         "GET",
         "https://api.redgifs.com/v2/gifs/decisivecelebrateduromastyxmaliensis",
@@ -273,9 +160,7 @@ async def test_provider_erodown_returns_only_first_valid_video():
 
 @pytest.mark.asyncio
 async def test_provider_erodown_returns_none_for_failed_response():
-    client = MockAsyncClient(
-        MockResponse(json_data={"success": False, "media": []})
-    )
+    client = MockAsyncClient(MockResponse(json_data={"success": False, "media": []}))
 
     variants = await bot.provider_erodown(
         "https://www.erome.com/a/DoesNotExist",
@@ -326,7 +211,9 @@ def test_extract_tweet_url_rejects_non_matching_strings():
 
 
 def test_extract_redgifs_url_matches_watch_urls():
-    text = "watch this https://www.redgifs.com/watch/decisivecelebrateduromastyxmaliensis"
+    text = (
+        "watch this https://www.redgifs.com/watch/decisivecelebrateduromastyxmaliensis"
+    )
 
     assert (
         bot.extract_redgifs_url(text)
@@ -373,7 +260,7 @@ async def test_extract_message_source_url_accepts_erome_album_urls():
 
 
 @pytest.mark.asyncio
-async def test_send_video_or_document_skips_send_video_when_file_exceeds_cap(tmp_path, monkeypatch):
+async def test_send_video_or_document_refuses_file_exceeding_cap(tmp_path, monkeypatch):
     class MockBot:
         def __init__(self):
             self.video_calls = 0
@@ -396,6 +283,6 @@ async def test_send_video_or_document_skips_send_video_when_file_exceeds_cap(tmp
         "https://www.redgifs.com/watch/example",
     )
 
-    assert uploaded is True
+    assert uploaded is False
     assert mock_bot.video_calls == 0
-    assert mock_bot.document_calls == 1
+    assert mock_bot.document_calls == 0
