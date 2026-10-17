@@ -773,6 +773,31 @@ def _providers_for_url(source_url: str):
     return PROVIDERS
 
 
+def _extract_tweet_id(tweet_url: str) -> str | None:
+    match = re.search(r"/status/(\d+)", tweet_url)
+    return match.group(1) if match else None
+
+
+async def fetch_tweet_images(tweet_url: str, client: httpx.AsyncClient) -> list[str] | None:
+    logger = logging.getLogger("fetch_tweet_images")
+    tweet_id = _extract_tweet_id(tweet_url)
+    if not tweet_id:
+        return None
+    try:
+        response = await client.get(
+            f"https://api.fxtwitter.com/i/status/{tweet_id}",
+            headers={"User-Agent": USER_AGENT},
+        )
+        response.raise_for_status()
+        payload = response.json()
+        photos = payload.get("tweet", {}).get("media", {}).get("photos", [])
+        urls = [p["url"] for p in photos if isinstance(p, dict) and isinstance(p.get("url"), str)]
+        return urls or None
+    except Exception as exc:
+        logger.warning("fxtwitter failed: %s", exc)
+        return None
+
+
 RESOLUTION_RE = re.compile(r"(\d{2,5})\s*[xX×]\s*(\d{2,5})")
 
 

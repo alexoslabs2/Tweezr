@@ -394,3 +394,61 @@ async def test_document_fallback_only_for_video_format_errors(
     )
     assert result is bool(expected_documents)
     assert telegram.documents == expected_documents
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("result", ["photos", "no_photos", "http_error", "invalid_json"])
+async def test_handler_image_fallback_after_all_video_providers_fail(
+    monkeypatch, caplog, result
+):
+    from unittest.mock import AsyncMock
+
+    source = "https://x.com/i/status/2069298839966638551"
+    photo = "https://pbs.twimg.com/media/example.jpg"
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        assert str(request.url) == (
+            "https://api.fxtwitter.com/i/status/2069298839966638551"
+        )
+        if result == "http_error":
+            return httpx.Response(503)
+        if result == "invalid_json":
+            return httpx.Response(200, text="invalid json")
+        photos = [{"url": photo}] if result == "photos" else []
+        return httpx.Response(200, json={"tweet": {"media": {"photos": photos}}})
+
+    client_class = httpx.AsyncClient
+    monkeypatch.setattr(
+        bot.httpx, "AsyncClient",
+        lambda **kwargs: client_class(transport=httpx.MockTransport(respond), **kwargs),
+    )
+    download = AsyncMock(return_value=None)
+    alert = AsyncMock()
+    monkeypatch.setattr(bot, "download_best_video", download)
+    monkeypatch.setattr(bot, "_alert_admin", alert)
+    telegram = SimpleNamespace(
+        send_photo=AsyncMock(), delete_message=AsyncMock(), send_video=AsyncMock()
+    )
+    ctx = SimpleNamespace(bot=telegram)
+    update = SimpleNamespace(channel_post=SimpleNamespace(text=source, message_id=42))
+
+    await bot.handle_message(update, ctx)
+
+    download.assert_awaited_once_with(source)
+    assert len(requests) == 1
+    assert "unhandled handler exception" not in caplog.text
+    telegram.send_video.assert_not_awaited()
+    if result == "photos":
+        telegram.send_photo.assert_awaited_once_with(
+            chat_id=bot.CHANNEL_ID, photo=photo, caption=source
+        )
+        telegram.delete_message.assert_awaited_once_with(
+            chat_id=bot.CHANNEL_ID, message_id=42
+        )
+        alert.assert_not_awaited()
+    else:
+        telegram.send_photo.assert_not_awaited()
+        telegram.delete_message.assert_not_awaited()
+        alert.assert_awaited_once_with(ctx, source)
